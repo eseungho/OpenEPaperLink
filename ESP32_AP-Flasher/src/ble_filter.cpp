@@ -67,13 +67,20 @@ uint8_t gicToOEPLtype(uint8_t gicType) {
     }
 }
 
-uint8_t wolinkToOEPLtype(uint16_t modelId) {
-    switch (modelId) {
-        case 0x000E:
-            return WOLINK_BLE_EPD_213_BWRY;
-        default:
-            return GICI_BLE_UNKNOWN;
+uint8_t wolinkToOEPLtype(uint16_t modelId, uint16_t hwVersion) {
+    // pid 0x000E is reused by multiple physical sizes; distinguish via the
+    // hw_version field at manuData[8..9] (BE) instead of pid alone:
+    //   0x0103 -> 2.13" 250x128 BWRY (e.g. WL17117F6A)
+    //   0x0201 -> 3.5"  384x184 BWRY (e.g. WL17402773)
+    // Anything else with the Wolink/Zhsunyco header (manuf id 0xAABB) but an
+    // unknown (modelId, hwVersion) is reported as WOLINK_BLE_UNKNOWN so the
+    // dashboard surfaces the tag without our BLE writer trying to push the
+    // wrong-size buffer to it.
+    if (modelId == 0x000E) {
+        if (hwVersion == 0x0103) return WOLINK_BLE_EPD_213_BWRY;
+        if (hwVersion == 0x0201) return WOLINK_BLE_EPD_350_BWRY;
     }
+    return WOLINK_BLE_UNKNOWN;
 }
 
 struct BleAdvDataStructV1 {
@@ -236,9 +243,11 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             // Reference: NickWaterton/Wolink wolink_ble.py decode_data()/decode_battery().
             Serial.printf("Wolink/Zhsunyco BLE ESL detected\r\n");
             uint16_t modelId = (manuData[4] << 8) | manuData[5];
+            uint16_t hwVersion = (manuData[8] << 8) | manuData[9];
             uint16_t battMv = (manuData[10] << 8) | manuData[11];
-            uint8_t hwType = wolinkToOEPLtype(modelId);
-            Serial.printf("Wolink modelId 0x%04X battery %u mV hwType 0x%02X\r\n", modelId, battMv, hwType);
+            uint8_t hwType = wolinkToOEPLtype(modelId, hwVersion);
+            Serial.printf("Wolink modelId 0x%04X hw 0x%04X battery %u mV hwType 0x%02X\r\n",
+                          modelId, hwVersion, battMv, hwType);
 
             struct espAvailDataReq theAdvData;
             memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
@@ -296,7 +305,9 @@ bool BLE_is_image_pending(uint8_t address[8]) {
     for (int16_t c = 0; c < tagDB.size(); c++) {
         tagRecord* taginfo = tagDB.at(c);
         if (taginfo->pendingCount > 0 && taginfo->version == 0 &&
-            (((taginfo->hwType & 0xF0) == 0xB0) || ((taginfo->hwType & 0xF0) == 0xD0))) {
+            (((taginfo->hwType & 0xF0) == 0xB0) ||
+             (taginfo->hwType == WOLINK_BLE_EPD_213_BWRY) ||
+             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY))) {
             memcpy(address, taginfo->mac, 8);
             return true;
         }
@@ -581,8 +592,9 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 // Pack the dual-bitplane source produced by makeimage into the Wolink/Zhsunyco
 // 2 bpp single-plane RAM layout. Source planes are width*byte_per_line bytes
 // each, ordered column-major (same convention compress_image() relies on).
-// Output: width*32 bytes (width=250, height=128 -> 8000), column-major,
-// y-axis flipped, 4 pixels per byte MSB-first, color map 00=B 01=W 10=Y 11=R.
+// Output: width * (height/4) bytes, column-major, y-axis flipped, 4 pixels per
+// byte MSB-first, color map 00=B 01=W 10=Y 11=R. width/height are picked from
+// the tag's hwType so the same routine handles every Wolink variant.
 // Returns the produced length, or 0 on failure.
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     PendingItem* queueItem = getQueueItem(address, 0);
@@ -603,12 +615,26 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
         file.close();
     }
 
-    // Hardcoded geometry for 2.13" BWRY for now; widen when more models land.
-    const uint16_t width = 250;
-    const uint16_t height = 128;
-    const uint32_t byte_per_line = height / 8;            // 16
-    const uint32_t plane_size = (uint32_t)width * byte_per_line;  // 4000
-    const uint32_t out_len = (uint32_t)width * (height / 4);      // 8000
+    tagRecord* taginfo = tagRecord::findByMAC(address);
+    uint8_t hwType = (taginfo != nullptr) ? taginfo->hwType : 0;
+    uint16_t width = 0, height = 0;
+    switch (hwType) {
+        case WOLINK_BLE_EPD_213_BWRY:
+            width = 250;
+            height = 128;
+            break;
+        case WOLINK_BLE_EPD_350_BWRY:
+            width = 384;
+            height = 184;
+            break;
+        default:
+            Serial.printf("Wolink pack: unsupported hwType 0x%02X, canceling\r\n", hwType);
+            prepareCancelPending(address);
+            return 0;
+    }
+    const uint32_t byte_per_line = (uint32_t)height / 8;
+    const uint32_t plane_size = (uint32_t)width * byte_per_line;
+    const uint32_t out_len = (uint32_t)width * ((uint32_t)height / 4);
 
     if (out_len > max_len) {
         Serial.printf("Wolink pack: buffer too small (%u < %u)\r\n",
@@ -632,7 +658,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             // black (1,0)->00, white (0,0)->01, red (0,1)->11, yellow (1,1)->10.
             uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
             int phy_y = (height - 1) - y;                  // Wolink RAM is y-flipped
-            uint32_t out_byte = (uint32_t)x * 32 + (phy_y / 4);
+            uint32_t out_byte = (uint32_t)x * (height / 4) + (phy_y / 4);
             int out_shift = 6 - (phy_y % 4) * 2;           // MSB-first within byte
             buffer[out_byte] |= color << out_shift;
         }

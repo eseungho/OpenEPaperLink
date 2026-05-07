@@ -75,6 +75,8 @@
 
 // Wolink / Zhsunyco BLE ESL family (0xDx range)
 #define WOLINK_BLE_EPD_213_BWRY 0xD0
+#define WOLINK_BLE_EPD_350_BWRY 0xD1
+#define WOLINK_BLE_UNKNOWN      0xDF
 
 // Solum types - customer data byte 16 in M3 (nRF) UICR
 #define STYPE_SIZE_016 0x40

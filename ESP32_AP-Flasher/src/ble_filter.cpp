@@ -218,15 +218,20 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             processDataReq(&theAdvData, true);
             return true;
         }
-        Serial.printf(" Wolink check: len=%d head=%02X%02X (need len>=12 head=BBAA)\r\n",
+        Serial.printf(" Wolink check: len=%d head=%02X%02X (need len>=12 head=AABB)\r\n",
                       manuDatalen, manuData[0], manuData[1]);
-        if (manuDatalen >= 12 && manuData[0] == 0xBB && manuData[1] == 0xAA) {
-            // Wolink/Zhsunyco BLE ESL. Manu data wire layout (12 bytes):
-            //   [0..1]   company id 0xAABB (LE)
+        if (manuDatalen >= 12 && manuData[0] == 0xAA && manuData[1] == 0xBB) {
+            // Wolink/Zhsunyco BLE ESL. Raw manuf data starts with company id
+            // bytes AA BB (i.e. 0xBBAA in BLE LE encoding); some scanners and
+            // the user's original capture report it as 0xAABB byte-swapped.
+            // Wire layout for the first 12 bytes (the 10 B payload after the
+            // company id is also re-broadcast a second time so total length
+            // is typically 22):
+            //   [0..1]   company id raw bytes AA BB
             //   [2..3]   flags
             //   [4..5]   model/PID, big-endian (0x000E = 2.13" BWRY)
-            //   [6..7]   firmware/state
-            //   [8..9]   sequence/state
+            //   [6..7]   app version (big-endian)
+            //   [8..9]   hw version (big-endian)
             //   [10..11] battery mV, big-endian
             // Reference: NickWaterton/Wolink wolink_ble.py decode_data()/decode_battery().
             Serial.printf("Wolink/Zhsunyco BLE ESL detected\r\n");

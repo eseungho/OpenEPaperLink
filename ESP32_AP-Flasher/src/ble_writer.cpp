@@ -378,20 +378,29 @@ static bool wolink_upload(uint8_t address[8]) {
     refresh[4] = (BLE_compressed_len >> 16) & 0xFF;
     refresh[5] = (BLE_compressed_len >> 24) & 0xFF;
     dataChar->writeValue(refresh, 6, true);
-    Serial.println("Wolink refresh triggered, waiting for status idle");
+    Serial.println("Wolink refresh triggered, waiting for first status notify or disconnect");
 
-    // 5) Wait for status notify with first byte == 0x00 (idle/done).
+    // 5) Wait for the FIRST status notify, OR a disconnect. Per upstream
+    // wolink_ble.py decode_status(): status[0] is busy(0xFF)/idle(0x00) and
+    // status[1] is the error code (0=ok, 1..5=EPD/OTA/unlock errors). The
+    // ESL routinely emits one busy notify mid-upload and then disconnects
+    // immediately after refresh without ever emitting an idle notify, so
+    // we mirror Python's "first notify ends the wait" semantics: any
+    // notify with err==0 is success, otherwise error. A disconnect with
+    // chunks already sent is treated as success too (refresh accepted).
     bool ok = false;
     uint32_t t_start = millis();
     while (millis() - t_start < 30000) {
         if (wolink_status_received) {
-            wolink_status_received = false;
-            if (wolink_status[0] == 0x00) {
-                ok = (wolink_status[1] == 0x00);
-                Serial.printf("Wolink upload %s (status %02X %02X)\r\n",
-                              ok ? "OK" : "ERR", wolink_status[0], wolink_status[1]);
-                break;
-            }
+            ok = (wolink_status[1] == 0x00);
+            Serial.printf("Wolink upload %s (status %02X %02X)\r\n",
+                          ok ? "OK" : "ERR", wolink_status[0], wolink_status[1]);
+            break;
+        }
+        if (!BLE_connected) {
+            ok = true;
+            Serial.println("Wolink upload OK (disconnected after refresh, no final notify)");
+            break;
         }
         delay(50);
     }

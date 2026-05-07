@@ -55,7 +55,7 @@ static BLEUUID gicImgUUID((uint16_t)0xfef2);
 static BLEUUID wolinkServiceUUID("30323032-4c53-4545-4c42-4b4e494c4f57");
 static BLEUUID wolinkDataUUID("31323032-4c53-4545-4c42-4b4e494c4f57");
 static BLEUUID wolinkAuthUUID("33323032-4c53-4545-4c42-4b4e494c4f57");
-static BLEUUID wolinkStatusUUID("35323032-4c53-4545-4c42-4b4e494c4f57");
+static BLEUUID wolinkStatusUUID("34323032-4c53-4545-4c42-4b4e494c4f57");
 
 static const uint8_t WOLINK_AES_KEY[16] = {
     0x9B, 0x60, 0x9F, 0x28, 0xBC, 0x49, 0xE2, 0x57,

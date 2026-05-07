@@ -217,7 +217,10 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.src[7] = manuData[1];
             processDataReq(&theAdvData, true);
             return true;
-        } else if (manuDatalen >= 12 && manuData[0] == 0xBB && manuData[1] == 0xAA) {
+        }
+        Serial.printf(" Wolink check: len=%d head=%02X%02X (need len>=12 head=BBAA)\r\n",
+                      manuDatalen, manuData[0], manuData[1]);
+        if (manuDatalen >= 12 && manuData[0] == 0xBB && manuData[1] == 0xAA) {
             // Wolink/Zhsunyco BLE ESL. Manu data wire layout (12 bytes):
             //   [0..1]   company id 0xAABB (LE)
             //   [2..3]   flags

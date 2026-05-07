@@ -649,6 +649,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
 
     memset(buffer, 0, out_len);
     for (int x = 0; x < width; x++) {
+        int phy_x = (width - 1) - x;                  // Wolink RAM is x-flipped too
         for (int y = 0; y < height; y++) {
             uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
             uint8_t mask = 0x80 >> (y % 8);
@@ -658,7 +659,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             // black (1,0)->00, white (0,0)->01, red (0,1)->11, yellow (1,1)->10.
             uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
             int phy_y = (height - 1) - y;                  // Wolink RAM is y-flipped
-            uint32_t out_byte = (uint32_t)x * (height / 4) + (phy_y / 4);
+            uint32_t out_byte = (uint32_t)phy_x * (height / 4) + (phy_y / 4);
             int out_shift = 6 - (phy_y % 4) * 2;           // MSB-first within byte
             buffer[out_byte] |= color << out_shift;
         }

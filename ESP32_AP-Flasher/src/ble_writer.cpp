@@ -456,7 +456,7 @@ void BLETask(void* parameter) {
                             }
                             BLE_last_pending_check = millis();
 #ifdef HAS_NEMONIC_PRINTER
-                        } else if (curHwType != 0 && (curHwType & 0xF0) == 0xE0) {
+                        } else if (curHwType == 0xE6) {
                             // Nemonic MIP-201 BLE label printer. Same synchronous-upload
                             // pattern as Wolink: connect, push the SDK split-frame
                             // sequence, trigger PRINT, disconnect.

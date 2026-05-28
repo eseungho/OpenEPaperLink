@@ -78,9 +78,10 @@
 #define WOLINK_BLE_EPD_350_BWRY 0xD1
 #define WOLINK_BLE_UNKNOWN      0xDF
 
-// Nemonic BLE label printer family (0xEx range)
+// Nemonic BLE label printer family (0xE6-0xEF range, picked to avoid the
+// already-allocated 0xE0..0xE5 display tagtypes in resources/tagtypes/).
 // MIP-201: 80mm thermal label printer, 576-dot wide, 1bpp B/W.
-#define NEMONIC_BLE_MIP201      0xE0
+#define NEMONIC_BLE_MIP201      0xE6
 #define NEMONIC_BLE_UNKNOWN     0xEF
 
 // Solum types - customer data byte 16 in M3 (nRF) UICR

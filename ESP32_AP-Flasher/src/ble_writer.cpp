@@ -7,6 +7,9 @@
 #include "ble_filter.h"
 #include "newproto.h"
 #include "tag_db.h"
+#ifdef HAS_NEMONIC_PRINTER
+#include "nemonic_printer.h"
+#endif
 
 #define INTERVAL_BLE_SCANNING_SECONDS 60
 #define INTERVAL_HANDLE_PENDING_SECONDS 10
@@ -452,6 +455,27 @@ void BLETask(void* parameter) {
                                 }
                             }
                             BLE_last_pending_check = millis();
+#ifdef HAS_NEMONIC_PRINTER
+                        } else if (curHwType != 0 && (curHwType & 0xF0) == 0xE0) {
+                            // Nemonic MIP-201 BLE label printer. Same synchronous-upload
+                            // pattern as Wolink: connect, push the SDK split-frame
+                            // sequence, trigger PRINT, disconnect.
+                            bool ok = nemonic_upload(BLE_curr_address);
+                            if (ok) {
+                                struct espXferComplete reportStruct;
+                                memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
+                                processXferComplete(&reportStruct, true);
+                                BLE_err_counter = 0;
+                            } else {
+                                if (BLE_err_counter++ >= 5) {
+                                    struct espXferComplete reportStruct;
+                                    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
+                                    processXferComplete(&reportStruct, true);
+                                    BLE_err_counter = 0;
+                                }
+                            }
+                            BLE_last_pending_check = millis();
+#endif
                         } else if (BLE_curr_address[7] == 0x13 && BLE_curr_address[6] == 0x37) {  // This is an ATC BLE OEPL display
                             // Here we create the compressed buffer
                             BLE_image_buffer = (uint8_t*)malloc(BUFFER_MAX_SIZE_COMPRESSING);

@@ -307,7 +307,11 @@ bool BLE_is_image_pending(uint8_t address[8]) {
         if (taginfo->pendingCount > 0 && taginfo->version == 0 &&
             (((taginfo->hwType & 0xF0) == 0xB0) ||
              (taginfo->hwType == WOLINK_BLE_EPD_213_BWRY) ||
-             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY))) {
+             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY)
+#ifdef HAS_NEMONIC_PRINTER
+             || ((taginfo->hwType & 0xF0) == 0xE0)
+#endif
+             )) {
             memcpy(address, taginfo->mac, 8);
             return true;
         }

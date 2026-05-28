@@ -1,0 +1,15 @@
+{
+	"version": 1,
+	"name": "Nemonic MIP-201 80mm B/W Label Printer",
+	"width": 576,
+	"height": 2000,
+	"rotatebuffer": 0,
+	"bpp": 1,
+	"colortable": {
+		"white": [ 255, 255, 255 ],
+		"black": [ 0, 0, 0 ]
+	},
+	"shortlut": 0,
+	"options": [ ],
+	"contentids": [ 22, 24, 1, 4 ]
+}

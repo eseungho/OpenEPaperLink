@@ -270,6 +270,38 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             processDataReq(&theAdvData, true);
             return true;
         }
+#ifdef HAS_NEMONIC_PRINTER
+        if (manuDatalen >= 2 && manuData[0] == 0x74 && manuData[1] == 0xF0) {
+            // Nemonic MIP-201 BLE thermal label printer.
+            // Company id 0xF074 (raw LE bytes 74 F0). Sample mfr data:
+            //   74 F0 7D 57 D0 DC 30 31    (per nRF Scanner trace)
+            //          \________________/
+            //           model / serial — not parsed in v1
+            // Device name observed: "nemonic_W" (SDK also lists "MIP-201").
+            Serial.printf("Nemonic BLE printer detected (mfr data %d bytes)\r\n", manuDatalen);
+
+            struct espAvailDataReq theAdvData;
+            memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
+            uint8_t macReversed[6];
+            memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+            theAdvData.src[0] = macReversed[5];
+            theAdvData.src[1] = macReversed[4];
+            theAdvData.src[2] = macReversed[3];
+            theAdvData.src[3] = macReversed[2];
+            theAdvData.src[4] = macReversed[1];
+            theAdvData.src[5] = macReversed[0];
+            theAdvData.src[6] = 0x00;  // dispatch is via hwType, not last-MAC bytes
+            theAdvData.src[7] = 0x00;
+            theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
+            theAdvData.adr.lastPacketLQI  = advertisedDevice.getRSSI();
+            theAdvData.adr.hwType = NEMONIC_BLE_MIP201;  // 0xE6
+            theAdvData.adr.tagSoftwareVersion = 0;
+            theAdvData.adr.capabilities = 0x00;  // matches Wolink/Gicisky convention (8-bit field)
+            theAdvData.adr.batteryMv = 0;  // not in advertisement; query via 1C 76 31 later if needed
+            processDataReq(&theAdvData, true);
+            return true;
+        }
+#endif
     }
     if (payloadDatalen >= 17) {  // Lets check for an ATC Mi Thermometer
         uint8_t macReversed[6];

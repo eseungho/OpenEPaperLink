@@ -1308,7 +1308,15 @@ function drawCanvas(buffer, canvas, hwtype, tagmac, doRotate) {
 		}
 	}
 
-	[canvas.width, canvas.height] = [tagTypes[hwtype].width, tagTypes[hwtype].height] || [0, 0];
+	if (tagTypes[hwtype].variable_height && data.length > 0 && tagTypes[hwtype].bpp == 1) {
+		// Label printer: derive canvas height from the actual .raw payload so the
+		// preview thumbnail shows only the rendered content (no trailing blank).
+		const widthBytes = tagTypes[hwtype].width / 8;
+		canvas.width = tagTypes[hwtype].width;
+		canvas.height = Math.max(1, Math.floor(data.length / widthBytes));
+	} else {
+		[canvas.width, canvas.height] = [tagTypes[hwtype].width, tagTypes[hwtype].height] || [0, 0];
+	}
 	if (tagTypes[hwtype].rotatebuffer % 2) [canvas.width, canvas.height] = [canvas.height, canvas.width];
 	if (tagTypes[hwtype].rotatebuffer >= 2) canvas.style.transform = 'rotate(180deg)';
 	if (doRotate == false && tagTypes[hwtype].rotatebuffer == 1) {
@@ -1619,6 +1627,7 @@ async function getTagtype(hwtype) {
 			zlib: parseInt(jsonData.zlib_compression || "0", 16),
 			g5: parseInt(jsonData.g5_compression || "0", 16),
 			shortlut: parseInt(jsonData.shortlut),
+			variable_height: jsonData.variable_height === true,
 			busy: false,
 			usetemplate: parseInt(jsonData.usetemplate || "0", 10)
 		};
@@ -1671,22 +1680,39 @@ function dropUpload() {
 
 				image.onload = function () {
 					const hwtype = tagCard.dataset.hwtype;
-					const [width, height] = [tagTypes[hwtype].width, tagTypes[hwtype].height] || [0, 0];
-					const canvas = createCanvas(width, height);
-					const ctx = canvas.getContext('2d');
+					const tagType = tagTypes[hwtype];
+					let canvas, ctx;
 
-					const scaleFactor = Math.max(
-						canvas.width / image.width,
-						canvas.height / image.height
-					);
-
-					const newWidth = image.width * scaleFactor;
-					const newHeight = image.height * scaleFactor;
-
-					const x = (canvas.width - newWidth) / 2;
-					const y = (canvas.height - newHeight) / 2;
-
-					ctx.drawImage(image, x, y, newWidth, newHeight);
+					if (tagType?.variable_height) {
+						// Label printer: fit to width, preserve aspect ratio, height
+						// follows the source image. tagType.height is treated as a
+						// maximum allowable height — the actual canvas height comes
+						// from the input's natural aspect ratio.
+						const targetWidth = tagType.width;
+						let targetHeight = Math.round(image.height * (targetWidth / image.width));
+						if (tagType.height && targetHeight > tagType.height) {
+							targetHeight = tagType.height;
+						}
+						canvas = createCanvas(targetWidth, targetHeight);
+						ctx = canvas.getContext('2d');
+						ctx.fillStyle = 'white';
+						ctx.fillRect(0, 0, targetWidth, targetHeight);
+						ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
+					} else {
+						// Fixed-size ESL display: cover-crop into the hwType canvas.
+						const [width, height] = [tagType.width, tagType.height] || [0, 0];
+						canvas = createCanvas(width, height);
+						ctx = canvas.getContext('2d');
+						const scaleFactor = Math.max(
+							canvas.width / image.width,
+							canvas.height / image.height
+						);
+						const newWidth = image.width * scaleFactor;
+						const newHeight = image.height * scaleFactor;
+						const x = (canvas.width - newWidth) / 2;
+						const y = (canvas.height - newHeight) / 2;
+						ctx.drawImage(image, x, y, newWidth, newHeight);
+					}
 
 					canvas.toBlob(async (blob) => {
 						const formData = new FormData();

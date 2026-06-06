@@ -72,6 +72,7 @@ uint8_t wolinkToOEPLtype(uint16_t modelId, uint16_t hwVersion) {
     // hw_version field at manuData[8..9] (BE) instead of pid alone:
     //   0x0103 -> 2.13" 250x128 BWRY (e.g. WL17117F6A)
     //   0x0201 -> 3.5"  384x184 BWRY (e.g. WL17402773)
+    //   0x0203 -> 7.5"  800x480 BWRY (e.g. WLC79007DA)
     // Anything else with the Wolink/Zhsunyco header (manuf id 0xAABB) but an
     // unknown (modelId, hwVersion) is reported as WOLINK_BLE_UNKNOWN so the
     // dashboard surfaces the tag without our BLE writer trying to push the
@@ -79,6 +80,7 @@ uint8_t wolinkToOEPLtype(uint16_t modelId, uint16_t hwVersion) {
     if (modelId == 0x000E) {
         if (hwVersion == 0x0103) return WOLINK_BLE_EPD_213_BWRY;
         if (hwVersion == 0x0201) return WOLINK_BLE_EPD_350_BWRY;
+        if (hwVersion == 0x0203) return WOLINK_BLE_EPD_750_BWRY;
     }
     return WOLINK_BLE_UNKNOWN;
 }
@@ -339,7 +341,8 @@ bool BLE_is_image_pending(uint8_t address[8]) {
         if (taginfo->pendingCount > 0 && taginfo->version == 0 &&
             (((taginfo->hwType & 0xF0) == 0xB0) ||
              (taginfo->hwType == WOLINK_BLE_EPD_213_BWRY) ||
-             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY)
+             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY) ||
+             (taginfo->hwType == WOLINK_BLE_EPD_750_BWRY)
 #ifdef HAS_NEMONIC_PRINTER
              || (taginfo->hwType == 0xE6)
 #endif
@@ -662,6 +665,10 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
         case WOLINK_BLE_EPD_350_BWRY:
             width = 384;
             height = 184;
+            break;
+        case WOLINK_BLE_EPD_750_BWRY:
+            width = 800;
+            height = 480;
             break;
         default:
             Serial.printf("Wolink pack: unsupported hwType 0x%02X, canceling\r\n", hwType);

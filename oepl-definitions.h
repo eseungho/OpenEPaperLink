@@ -76,6 +76,7 @@
 // Wolink / Zhsunyco BLE ESL family (0xDx range)
 #define WOLINK_BLE_EPD_213_BWRY 0xD0
 #define WOLINK_BLE_EPD_350_BWRY 0xD1
+#define WOLINK_BLE_EPD_750_BWRY 0xD2
 #define WOLINK_BLE_UNKNOWN      0xDF
 
 // Nemonic BLE label printer family (0xE6-0xEF range, picked to avoid the

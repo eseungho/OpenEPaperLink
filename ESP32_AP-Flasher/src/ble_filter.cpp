@@ -629,12 +629,30 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 }
 
 // Pack the dual-bitplane source produced by makeimage into the Wolink/Zhsunyco
-// 2 bpp single-plane RAM layout. Source planes are width*byte_per_line bytes
-// each, ordered column-major (same convention compress_image() relies on).
-// Output: width * (height/4) bytes, column-major, y-axis flipped, 4 pixels per
-// byte MSB-first, color map 00=B 01=W 10=Y 11=R. width/height are picked from
-// the tag's hwType so the same routine handles every Wolink variant.
+// tag RAM layout. Source planes are width*byte_per_line bytes each, column-major.
+// 2.13"/3.5" use the proven 2 bpp single-plane layout (width*height/4 bytes,
+// column-major, y-flipped, 4 px/byte MSB-first, map 00=B 01=W 10=Y 11=R).
+//
+// 7.5" 800x480 is NOT in the upstream NickWaterton reference and uses a DIFFERENT
+// RAM format. Field symptom: a white background renders as fine black/white
+// stipple -> the panel reads the data as 1bpp planes (a white run of 0x01 2-bit
+// codes packs to 0x55 = 01010101, which is "stripes" when read 1bpp), so it
+// expects TWO 1bpp planes (B/W + colour), not 2bpp interleaved. The toggles below
+// flash-test the remaining unknowns. Change ONE, rebuild, flash, observe:
+//   white still stippled ......... DUAL_PLANE not effective / wrong plane split
+//   whole image inverted (B<->W) . flip WOLINK75_INVERT_BW
+//   image mirrored left/right .... flip WOLINK75_XFLIP
+//   image flipped top/bottom ..... flip WOLINK75_YFLIP
+//   colour wrong, B/W ok ......... flip WOLINK75_INVERT_COLOR / WOLINK75_PLANE_COLOR_FIRST
+//   bits within byte reversed .... flip WOLINK75_MSB_FIRST
 // Returns the produced length, or 0 on failure.
+#define WOLINK75_DUAL_PLANE        1  // 1 = two 1bpp planes (B/W + colour); 0 = legacy 2bpp interleaved
+#define WOLINK75_PLANE_COLOR_FIRST 0  // 0 = B/W plane first, colour second; 1 = colour first
+#define WOLINK75_INVERT_BW         1  // invert B/W plane bits (panels often want 1=white)
+#define WOLINK75_INVERT_COLOR      0  // invert colour plane bits
+#define WOLINK75_XFLIP             0  // mirror left/right (the reference does NOT x-flip Wolink)
+#define WOLINK75_YFLIP             1  // mirror top/bottom
+#define WOLINK75_MSB_FIRST         1  // 1 = MSB-first within byte; 0 = LSB-first
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     PendingItem* queueItem = getQueueItem(address, 0);
     if (queueItem == nullptr) {
@@ -691,6 +709,40 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
     }
 
     memset(buffer, 0, out_len);
+
+#if WOLINK75_DUAL_PLANE
+    if (hwType == WOLINK_BLE_EPD_750_BWRY) {
+        // --- experiment: two 1bpp planes (B/W + colour), de-interleaved ---
+        // Output = [planeA (width*height/8) | planeB (width*height/8)] = width*height/4 total.
+        Serial.printf("Wolink 7.5\" dual-plane pack: order=%s invBW=%d invC=%d xflip=%d yflip=%d msb=%d\r\n",
+                      WOLINK75_PLANE_COLOR_FIRST ? "C,BW" : "BW,C",
+                      WOLINK75_INVERT_BW, WOLINK75_INVERT_COLOR,
+                      WOLINK75_XFLIP, WOLINK75_YFLIP, WOLINK75_MSB_FIRST);
+        const uint32_t out_bpl = (uint32_t)height / 8;          // bytes per column in one plane
+        const uint32_t out_plane = (uint32_t)width * out_bpl;   // == plane_size
+        uint8_t* bwPlane    = WOLINK75_PLANE_COLOR_FIRST ? (buffer + out_plane) : buffer;
+        uint8_t* colorPlane = WOLINK75_PLANE_COLOR_FIRST ? buffer : (buffer + out_plane);
+        for (int x = 0; x < width; x++) {
+            int phy_x = WOLINK75_XFLIP ? (width - 1 - x) : x;
+            for (int y = 0; y < height; y++) {
+                uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
+                uint8_t mask = 0x80 >> (y % 8);
+                uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;                 // black|yellow
+                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;    // red|yellow
+                uint8_t bw    = WOLINK75_INVERT_BW    ? (p1 ? 0 : 1) : p1;
+                uint8_t color = WOLINK75_INVERT_COLOR ? (p2 ? 0 : 1) : p2;
+                int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
+                uint32_t ob = (uint32_t)phy_x * out_bpl + (phy_y / 8);
+                uint8_t omask = WOLINK75_MSB_FIRST ? (0x80 >> (phy_y % 8)) : (1 << (phy_y % 8));
+                if (bw)    bwPlane[ob]    |= omask;
+                if (color) colorPlane[ob] |= omask;
+            }
+        }
+        return out_len;
+    }
+#endif
+
+    // --- legacy 2 bpp interleaved (2.13"/3.5", proven; 7.5" only if DUAL_PLANE=0) ---
     for (int x = 0; x < width; x++) {
         int phy_x = (width - 1) - x;                  // Wolink RAM is x-flipped too
         for (int y = 0; y < height; y++) {

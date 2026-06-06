@@ -1,96 +1,208 @@
-# Wolink / Zhsunyco BLE ESL — protocol notes (from manufacturer app RE)
+# Wolink / Zhsunyco BLE ESL — OpenEPaperLink support reference
 
-Reverse-engineered from the manufacturer Android app **"WoPda"** (pkg `d29lc2w.new_pda`),
-a Flutter app. Static analysis with [blutter](https://github.com/worawit/blutter) against
-`lib/arm64-v8a/libapp.so` (Flutter **3.9.2** / Dart **3.9.2**, snapshot `97ff04a7…`, not obfuscated).
-This complements the original RE in `NickWaterton/Wolink` (`wolink_ble.py`) that the OEPL
-`ble_filter.cpp` / `ble_writer.cpp` Wolink support is based on.
+End-to-end documentation of the Wolink/Zhsunyco Bluetooth-LE electronic shelf label support in this
+OpenEPaperLink (OEPL) fork: architecture, data flow, device configuration, the BLE protocol, the
+image packing, a file/function code map, and how it was reverse-engineered.
 
-## TL;DR — what the app does and does NOT contain
-- The app is a **thin BLE relay**. The label image is **rendered AND packed on the vendor cloud**
-  (endpoints `/eslpng/`, `/template/query?type=epd`, `/mobile/ack/ble`). The app fetches it
-  (`API::get` / `DioService`), **base64-decodes** it (`Base64Codec.decode`), and streams the bytes
-  over BLE. **No pixel packing, dithering, colour mapping, or image compression exists anywhere in
-  the decompiled app** (verified: no image-size constants, no `decodeImage`/`getBytes`/`ZLibCodec`
-  in the BLE path).
-- ⇒ The **pixel-packing / colour matrix ("노브 조합") is NOT extractable from the APK** — it lives on
-  the server. The APK *is* authoritative for the **BLE transport** (UUIDs, auth, framing, CRC,
-  firmware-version handling).
+---
 
-## Tech stack (from `asm/<pkg>/` dirs)
-`flutter_blue_plus` (BLE) · `flutter_nfc_kit`/`ndef` (NFC path) · `encrypt`+`pointycastle` (AES) ·
-`dio` (cloud API) · GetX (state). App code under `app/utils/ble.dart`, `app/utils/tools.dart`,
-`app/modules/skyline/{ble,nfc,esl,esl_wifi,pad}/…`.
+## 1. Overview — where BLE ESLs fit in OEPL
 
-## GATT service & characteristics
-Vendor UUIDs are ASCII strings stored little-endian, so the bytes read reversed as
+OEPL was built around a sub-GHz / 802.15.4 radio: an ESP32 **access point (AP)** drives a tag-radio
+co-processor and talks to native OEPL tags. This fork adds **direct BLE ESL** support so the same
+ESP32 AP can also drive third-party Bluetooth labels — **Gicisky** (`0xB*`), **Wolink/Zhsunyco**
+(`0xD*`), **Nemonic** printer (`0xE6`) and **ATC_BLE_OEPL** — using the ESP32's built-in Bluetooth.
+
+A BLE tag is **not** polled like a sub-GHz tag; instead the AP runs a dedicated FreeRTOS **BLE task**
+that scans for advertisements and, when content is pending, connects out to the label and pushes the
+image. Everything for Wolink lives in the AP firmware under `ESP32_AP-Flasher/`.
+
+Wolink labels are **BWRY** (black / white / red / yellow, 2 bits per pixel). Three sizes are
+supported: **2.13"** 250×128 (`0xD0`), **3.5"** 384×184 (`0xD1`), **7.5"** 800×480 (`0xD2`).
+
+---
+
+## 2. End-to-end data flow
+
+```
+ web UI / content system
+      │  set content for a tag MAC
+      ▼
+ contentmanager.cpp ── jpg2buffer()/spr2color() (makeimage.cpp)
+      │  render template → file on contentFS =
+      │  [ B/W plane | colour plane ]  (each width*height/8 B, 1bpp, column-major)
+      │  enqueue PendingItem(MAC, filename)
+      ▼
+ BLETask()  (ble_writer.cpp)         ← FreeRTOS task, runs continuously
+   IDLE loop:
+     • BLE_startScan() every INTERVAL_BLE_SCANNING_SECONDS
+         └─ onResult → BLE_filter_add_device() (ble_filter.cpp)
+              parse mfr data "AA BB …" → modelId/hwVersion/battery
+              wolinkToOEPLtype() → hwType 0xD0/D1/D2 → processDataReq() (registers tag)
+     • BLE_is_image_pending() every INTERVAL_HANDLE_PENDING_SECONDS
+         └─ if (hwType & 0xF0)==0xD0 → wolink_upload(MAC)
+                                          │
+                                          ▼
+ wolink_upload() (ble_writer.cpp):
+   1 connect + setMTU(247)
+   2 discover service 30323032-… ; get Data/Auth/Status characteristics
+   3 AUTH: read 16-B challenge ← Auth char; AES-128-CBC(zero IV, key) → write 16-B response
+   4 PACK: pack_wolink_image() reads the rendered dual-plane file → tag RAM buffer
+   5 UPLOAD: Data char ← [00 A5][offset LE32] + ≤238 B  (repeat over the whole buffer)
+   6 REFRESH: Data char ← [01 A5][total_len LE32]
+   7 wait for Status notify (busy/idle, error) or disconnect
+      │ success → processXferComplete() removes the pending item
+      ▼
+   label refreshes
+```
+
+---
+
+## 3. Device detection & configuration
+
+### Advertisement detection (`ble_filter.cpp :: BLE_filter_add_device`)
+Wolink labels advertise manufacturer data starting with company id bytes **`AA BB`** (≥12 B). Layout:
+
+| bytes | field | notes |
+|---|---|---|
+| 0..1 | company id | `AA BB` |
+| 2..3 | flags | |
+| 4..5 | model / PID | big-endian (`0x000E` = 2.13") |
+| 6..7 | app version | big-endian |
+| 8..9 | **hw version** | big-endian — selects the size |
+| 10..11 | battery mV | big-endian |
+
+`wolinkToOEPLtype(modelId, hwVersion)` maps hw version → OEPL hwType:
+
+| hwVersion | size | hwType | tagtype |
+|---|---|---|---|
+| `0x0103` | 2.13" 250×128 | `WOLINK_BLE_EPD_213_BWRY` `0xD0` | `resources/tagtypes/D0.json` |
+| `0x0201` | 3.5" 384×184 | `WOLINK_BLE_EPD_350_BWRY` `0xD1` | `D1.json` |
+| `0x0203` | 7.5" 800×480 | `WOLINK_BLE_EPD_750_BWRY` `0xD2` | `D2.json` |
+| other | unknown | `WOLINK_BLE_UNKNOWN` `0xDF` | `DF.json` |
+
+### Tag type JSON (`resources/tagtypes/D2.json`)
+Drives rendering/colour for the web UI and `makeimage`:
+```json
+{ "name": "Wolink/Zhsunyco BLE EPD BWRY 7.5\"", "width": 800, "height": 480,
+  "rotatebuffer": 1, "bpp": 2,
+  "colortable": { "white":[255,255,255], "black":[0,0,0], "red":[255,0,0], "yellow":[255,255,0] } }
+```
+
+### Adding a new Wolink model
+1. `#define WOLINK_BLE_EPD_… 0xD?` in **`oepl-definitions.h`**.
+2. Add the `(modelId,hwVersion)→hwType` case in **`wolinkToOEPLtype()`**.
+3. Create **`resources/tagtypes/<HEX>.json`** (width/height/bpp/rotatebuffer/colortable).
+4. Add a width/height case in **`pack_wolink_image()`**; pick the scan (small tags column-major,
+   large panels row-major — see §5).
+
+---
+
+## 4. BLE protocol (GATT, auth, framing)
+
+Reverse-engineered from the manufacturer **"WoPda"** Flutter app (`blutter` on `libapp.so`,
+Flutter/Dart 3.9.2) plus the upstream `NickWaterton/Wolink` Python project. The app is a thin BLE
+relay — **image rendering/packing happens on the vendor cloud** (`/eslpng/`, `/template/query`); the
+app base64-decodes and streams it. So the **packing is not in the app**; it was found on hardware.
+
+**GATT** — UUIDs are ASCII strings stored little-endian, so the bytes read reversed as
 `WOLINKBLEESL2020…2025`:
 
-| UUID | Role (app) | Used by OEPL? |
+| UUID | role | used by OEPL |
 |---|---|---|
-| `30323032-4C53-4545-4C42-4B4E494C4F57` | **Service** (…ESL2020) | yes |
-| `31323032-…` (2021) | **Data** (image chunks) | yes (`wolinkDataUUID`) |
-| `32323032-…` (2022) | **Config** | **no** |
-| `33323032-…` (2023) | **Auth** (challenge/response) | yes (`wolinkAuthUUID`) |
-| `34323032-…` (2024) | **Status** (notify) | yes (`wolinkStatusUUID`) |
-| `35323032-…` (2025) | **Battery / info** | **no** |
-| `3e3d1158-5656-4217-b715-266f37eb5000` | second service (OTA/`UpgradeService`, `OTA_ERROR`) | no |
+| `30323032-4C53-4545-4C42-4B4E494C4F57` | Service | yes |
+| `31323032-…` | **Data** (image chunks + refresh) | yes |
+| `32323032-…` | Config | no |
+| `33323032-…` | **Auth** | yes |
+| `34323032-…` | **Status** (notify) | yes |
+| `35323032-…` | Battery/info | no |
+| `3e3d1158-5656-4217-b715-266f37eb5000` | OTA service (`UpgradeService`) | no |
 
-## Authentication — CONFIRMED, key matches OEPL
-`tools.dart :: genBleSecret` builds the 16-byte key **inline** (as Dart smi immediates, value =
-`imm >> 1`) then `Key()/IV()/AES()` (`encrypt` pkg), AES-128-**CBC**, zero IV:
-
+**Authentication** (`ble_writer.cpp :: wolink_aes_encrypt_challenge`) — AES-128-**CBC**, zero IV,
+16-byte key, confirmed identical in the app's `genBleSecret` and in OEPL:
 ```
-key = 9B 60 9F 28 BC 49 E2 57 29 BD 7B 8D F2 2B 44 20   ← identical to OEPL WOLINK_AES_KEY
+9B 60 9F 28 BC 49 E2 57 29 BD 7B 8D F2 2B 44 20
 ```
-Flow: read 16-byte challenge from Auth char → AES-CBC encrypt → write 16-byte response.
-**OEPL's auth is therefore correct** (this is also why scan/connect/transfer already work).
+Read 16-B challenge from the Auth char → AES-CBC encrypt → write the first 16-B block back.
 
-## Framing
-`ble.dart :: transceive` is the single BLE I/O routine:
-1. `discoverServices`, `mtuNow`.
-2. Auth (above).
-3. Read device **firmware-version** string and branch via `String.contains` on:
-   `01-00-00-01 / -03 / -06 / -07 / -09 / -0C / -12 / -13` — **per-version handling = the real
-   "model↔mode" matrix**. OEPL has **no** version branching.
-4. Image bytes (base64-decoded) sent in MTU-sized pieces (`Uint8List.sublist` loop → 11×
-   `BluetoothCharacteristic.write`).
-5. A commit/refresh frame protected by **`tools.dart :: crc16Cal`** — dual 256-entry tables,
-   init `0xFFFF` ⇒ **CRC-16/MODBUS** (poly 0x8005 reflected / 0xA001). **OEPL sends no CRC.**
+**Framing** (`wolink_upload`):
+- image chunks → Data char: `[0x00, 0xA5] + offset(LE32) + payload` (≤238 B, MTU 247 − 9).
+- refresh    → Data char: `[0x01, 0xA5] + total_len(LE32)`.
+- status     ← Status char notify: 2 B `[busy/idle, error]` (0 = ok).
 
-Other RX helpers: `tools.dart :: decompress` (GZip/ZLib) + `aesDecode` — used for data the app
-*receives* (tag/cloud), consistent with the tag's `DECOMPRESS_ERROR` code (tag decompresses what
-it is sent).
+The manufacturer app additionally protects its commit frame with **CRC-16/MODBUS** (`tools.dart ::
+crc16Cal`, dual 256-entry tables, init `0xFFFF`) and branches on firmware-version strings
+(`01-00-00-xx`); OEPL's upload succeeds without these. (`DECOMPRESS_ERROR`/`OTA_ERROR` are tag-side
+codes; the cloud may zlib-compress very large frames — not needed for the sizes here.)
 
-## Error codes (`BleError.toString`)
-`OK, EPD_INIT_ERROR, EPD_WRITE_ERROR, DECOMPRESS_ERROR, OTA_ERROR, UNLOCK ERROR, ACK_ERROR …`
+---
 
-## 7.5" BWRY corruption — diagnosis & fix
-The 7.5" panel format was found on hardware by iterating against field photos; each stage is
-reproduced offline by `wolink_harness.py` (this dir). The panel reads **2 bpp, ROW-major**
-(00=B 01=W 10=Y 11=R). The diagnosis chain:
+## 5. Image rendering & packing
 
-| pack attempt | how the 2bpp row-major panel renders it | photo |
-|---|---|---|
-| 2bpp **column**-major (original) | "comb teeth"/90° + white stipple (scan transposed) | yes |
-| 1bpp **dual-plane** row-major | image readable but **2×2 tiled, colours wrong** (panel is 2bpp, not 1bpp) | yes |
-| **2bpp row-major** | **correct** | — |
+### Source: `makeimage.cpp`
+`jpg2buffer()` renders the template into a sprite; `spr2color()` (Burkes/ordered dithering, palette
+from the tagtype) writes a **dual 1-bit-plane** file: plane 1 = B/W, plane 2 = colour, each
+`width*height/8` bytes, **column-major** (with `rotatebuffer:1` applied). Per source pixel:
+`p1 (B/W)=1 for BLACK|YELLOW`, `p2 (colour)=1 for RED|YELLOW`.
 
-Why each symptom: column-major data read row-major transposes → combs; white `01` packed 2bpp = `0x55`
-read as the wrong scan = stipple; sending two 1bpp planes to a 2bpp panel halves the horizontal rate
-and maps the two planes to the top/bottom screen halves → four tiles with the B/W bits reinterpreted
-as 2-bit colour codes.
+### Pack: `ble_filter.cpp :: pack_wolink_image()`
+Converts the dual-plane source into the tag's RAM layout. Output is always `width*height/4` bytes.
 
-**Fix (shipped):** `ble_filter.cpp :: pack_wolink_image()` packs the 7.5" as **2 bpp row-major**
-(`WOLINK75_DUAL_PLANE=0, ROW_MAJOR=1, XFLIP=1`). Output stays 96000 B so `wolink_upload()` framing is
-unchanged; the 2.13"/3.5" column-major path is untouched. Any residual single global transform
-(mirror / upside-down / red↔yellow) is one `WOLINK75_*` toggle — see the in-code symptom guide.
+- **2.13" / 3.5"**: 2 bpp, **column-major**, both axes flipped, 4 px/byte MSB-first. *(unchanged,
+  proven)*
+- **7.5" 800×480**: 2 bpp, **row-major** (native panel scan), `XFLIP=1`. **This is the working
+  format.** Colour code (both): `hi=p2, lo=~p1` ⇒ **`00=black 01=white 10=yellow 11=red`**.
 
-Secondary (not implicated by the observed symptoms): the cloud may **zlib-compress** large panels
-(`DECOMPRESS_ERROR`) and the commit frame carries **CRC-16/MODBUS** — last resort only.
+The 7.5" format was found by iterating against field photos (each stage reproduced offline by
+`wolink_harness.py`):
 
-## Definitive verification (no BLE sniffer needed)
-Enable **Android Developer Options → "Bluetooth HCI snoop log"** on a phone running WoPda, push a
-label to the real 7.5" tag, pull `btsnoop_hci.log`, open in Wireshark. This captures the **exact
-packed bytes + framing (CRC, opcodes, compression)** directly — the one source that resolves the
-server-side packing.
+| pack attempt | result on the real (2bpp row-major) panel |
+|---|---|
+| 2 bpp **column**-major (first try) | "comb teeth" / 90° + white stipple (scan transposed) |
+| 1 bpp **dual-plane** row-major | image readable but **2×2 tiled, colours wrong** (panel is 2bpp) |
+| **2 bpp row-major** | **correct** |
+
+Compile-time knobs at the top of `pack_wolink_image()` (apply to the **7.5" only**) let you correct a
+single residual global transform without re-deriving anything:
+
+| symptom | toggle |
+|---|---|
+| mirrored left/right | `WOLINK75_XFLIP` |
+| upside down | `WOLINK75_YFLIP` |
+| red ↔ yellow swapped | `WOLINK75_SWAP_RY` |
+| bits within byte reversed | `WOLINK75_MSB_FIRST` |
+| (diagnostic) two 1bpp planes instead of 2bpp | `WOLINK75_DUAL_PLANE` |
+| (diagnostic) column- vs row-major | `WOLINK75_ROW_MAJOR` |
+
+Defaults: `DUAL_PLANE=0, ROW_MAJOR=1, XFLIP=1, YFLIP=0, MSB_FIRST=1, SWAP_RY=0`. Each pack logs its
+active config over serial: `Wolink 7.5" pack: 2BPP scan=row xflip=1 …`.
+
+---
+
+## 6. Code map
+
+| file | responsibility |
+|---|---|
+| `ESP32_AP-Flasher/src/ble_filter.cpp` | advertisement scan & detection (`BLE_filter_add_device`), `wolinkToOEPLtype()`, **packing** `pack_wolink_image()` |
+| `ESP32_AP-Flasher/src/ble_writer.cpp` | BLE task `BLETask()`, connect/MTU, **`wolink_upload()`** (auth/chunk/refresh), UUIDs, AES key |
+| `ESP32_AP-Flasher/src/makeimage.cpp` | render template → dual 1bpp plane file (`jpg2buffer`, `spr2color`) |
+| `oepl-definitions.h` | `WOLINK_BLE_EPD_*` hwType constants (`0xD0`/`D1`/`D2`/`DF`) |
+| `resources/tagtypes/D0–D2,DF.json` | per-size specs (dimensions, bpp, rotatebuffer, colours) |
+| `miscellaneous/wolink_ble_protocol/` | this reference + `wolink_harness.py` |
+
+---
+
+## 7. How it was reverse-engineered (reproducible)
+
+The packing isn't in the app (server-side), so it was solved with **(a)** static RE of the BLE
+transport and **(b)** an offline pixel-packing simulator validated against field photos.
+
+- **Static RE:** `blutter` (Dart AOT decompiler) on `lib/arm64-v8a/libapp.so`. It recovered class /
+  method names (un-obfuscated), the object pool, and disassembly — yielding the GATT roles, the AES
+  key in `genBleSecret`, the CRC-16/MODBUS in `crc16Cal`, and the proof that packing is server-side.
+- **Offline packing simulator:** `wolink_harness.py` models the panel as a decoder and our packer as
+  the encoder. Feeding our output through a candidate panel model reproduces each field-photo symptom
+  (stipple → comb teeth → 2×2 tiling) and confirms the fix renders cleanly — so candidate fixes are
+  vetted before flashing. Run: `python3 wolink_harness.py 800 480` (writes PPMs to `/tmp`).
+
+No Bluetooth sniffer or rooted phone is required by this method.

@@ -51,6 +51,26 @@ After programming the ESP32, make sure to also program the filesystem. This will
 - If all blocks are received, the tag will send a 'transfer complete'. 
 - The AP will report the completed transfer to the ESP32, and removes the pendingData for this transfer from the queue
 
+## BLE ESL support (this fork)
+
+In addition to the sub-GHz / 802.15.4 protocol above, this fork lets the ESP32 access point drive
+several **third-party Bluetooth-LE labels directly**, using the ESP32's built-in Bluetooth — no tag
+radio involved. Instead of waiting for tags to check in, a dedicated FreeRTOS **BLE task** scans for
+advertisements and, when content is pending, connects out to the label and pushes the image.
+
+Supported BLE families (hwType range): **Gicisky** (`0xB*`), **Wolink/Zhsunyco** BWRY 2.13"/3.5"/7.5"
+(`0xD0`/`0xD1`/`0xD2`), **Nemonic** MIP-201 printer (`0xE6`), and the native **ATC_BLE_OEPL**. The
+code lives in `ESP32_AP-Flasher/src/ble_filter.cpp` (scan/detect + image packing) and
+`ble_writer.cpp` (connect, authenticate, upload).
+
+Typical BLE push: scan → map advertisement to an OEPL hwType → render the template
+(`makeimage.cpp`) → pack to the panel's RAM format → connect, authenticate, write the image in
+chunks, trigger a refresh.
+
+📄 **Full reverse-engineering + architecture write-up for the Wolink/Zhsunyco family** (GATT UUIDs,
+AES auth, framing, the 2 bpp row-major packing, device detection, code map, and the offline
+verification harness): [`miscellaneous/wolink_ble_protocol/`](miscellaneous/wolink_ble_protocol/README.md).
+
 ## Known issues:
 - Some tags work better as APs than others. Your range may suck. The boards on these tags are tiny and fragile. For instance, a dab of hot-glue on a board is enough to warp it pretty severely, and will damage the components that are soldered on there. Reportedly, segmented-display Solum tags work well. 
 

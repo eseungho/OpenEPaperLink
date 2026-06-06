@@ -66,25 +66,28 @@ it is sent).
 `OK, EPD_INIT_ERROR, EPD_WRITE_ERROR, DECOMPRESS_ERROR, OTA_ERROR, UNLOCK ERROR, ACK_ERROR …`
 
 ## 7.5" BWRY corruption — diagnosis & fix
-Two stacked symptoms, both reproduced offline by `wolink_harness.py` (this dir):
+The 7.5" panel format was found on hardware by iterating against field photos; each stage is
+reproduced offline by `wolink_harness.py` (this dir). The panel reads **2 bpp, ROW-major**
+(00=B 01=W 10=Y 11=R). The diagnosis chain:
 
-1. **Fine stipple over white.** In 2bpp, white = `01`, so a white run packs to `0x55` = `01010101`;
-   a panel reading it as a **1bpp plane** shows stripes. ⇒ the 7.5" wants **two 1bpp planes
-   (B/W + colour)**, not 2bpp interleaved. (The upstream reference has no 800×480 entry; large BWRY
-   panels commonly use dual planes.)
-2. **Evenly-spaced vertical "comb teeth" / 90-deg look.** The small tags store data **column-major**;
-   the 800×480 panel scans **row-major**. Emitting column-major to a row-major panel tiles the image
-   into vertical combs — matches the field photo. ⇒ pack **row-major**.
+| pack attempt | how the 2bpp row-major panel renders it | photo |
+|---|---|---|
+| 2bpp **column**-major (original) | "comb teeth"/90° + white stipple (scan transposed) | yes |
+| 1bpp **dual-plane** row-major | image readable but **2×2 tiled, colours wrong** (panel is 2bpp, not 1bpp) | yes |
+| **2bpp row-major** | **correct** | — |
 
-**Fix (shipped):** `ble_filter.cpp :: pack_wolink_image()` has a dual-plane, row-major path for the
-7.5" behind `WOLINK75_*` toggles (defaults `DUAL_PLANE=1, ROW_MAJOR=1`). Output stays 96000 B so
-`wolink_upload()` framing is unchanged; the 2.13"/3.5" 2bpp path is untouched. With row-major dual
-planes the geometry is correct; any residual global mirror/flip/colour-swap is one toggle away
-(see the in-code symptom guide).
+Why each symptom: column-major data read row-major transposes → combs; white `01` packed 2bpp = `0x55`
+read as the wrong scan = stipple; sending two 1bpp planes to a 2bpp panel halves the horizontal rate
+and maps the two planes to the top/bottom screen halves → four tiles with the B/W bits reinterpreted
+as 2-bit colour codes.
 
-Secondary (only if it still fails after geometry is right): the cloud may **zlib-compress** large
-panels (`DECOMPRESS_ERROR`) and the commit frame carries **CRC-16/MODBUS** — not needed to explain
-the observed symptoms, so treat as last resort.
+**Fix (shipped):** `ble_filter.cpp :: pack_wolink_image()` packs the 7.5" as **2 bpp row-major**
+(`WOLINK75_DUAL_PLANE=0, ROW_MAJOR=1, XFLIP=1`). Output stays 96000 B so `wolink_upload()` framing is
+unchanged; the 2.13"/3.5" column-major path is untouched. Any residual single global transform
+(mirror / upside-down / red↔yellow) is one `WOLINK75_*` toggle — see the in-code symptom guide.
+
+Secondary (not implicated by the observed symptoms): the cloud may **zlib-compress** large panels
+(`DECOMPRESS_ERROR`) and the commit frame carries **CRC-16/MODBUS** — last resort only.
 
 ## Definitive verification (no BLE sniffer needed)
 Enable **Android Developer Options → "Bluetooth HCI snoop log"** on a phone running WoPda, push a

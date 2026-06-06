@@ -629,32 +629,36 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 }
 
 // Pack the dual-bitplane source produced by makeimage into the Wolink/Zhsunyco
-// tag RAM layout. Source planes are width*byte_per_line bytes each, column-major.
-// 2.13"/3.5" use the proven 2 bpp single-plane layout (width*height/4 bytes,
-// column-major, y-flipped, 4 px/byte MSB-first, map 00=B 01=W 10=Y 11=R).
+// tag RAM layout. Source planes are width*byte_per_line bytes each, column-major,
+// 1 bit/pixel: plane1 (B/W) then plane2 (colour). Output is width*height/4 bytes.
 //
-// 7.5" 800x480 is NOT in the upstream NickWaterton reference and uses a DIFFERENT
-// RAM format. Field symptom: a white background renders as fine black/white
-// stipple -> the panel reads the data as 1bpp planes (a white run of 0x01 2-bit
-// codes packs to 0x55 = 01010101, which is "stripes" when read 1bpp), so it
-// expects TWO 1bpp planes (B/W + colour), not 2bpp interleaved. The toggles below
-// flash-test the remaining unknowns. Change ONE, rebuild, flash, observe:
-//   evenly-spaced vertical "comb teeth" / looks 90-deg .. flip WOLINK75_ROW_MAJOR (scan order)
-//   white still stippled ......... DUAL_PLANE not effective / wrong plane split
-//   whole image inverted (B<->W) . flip WOLINK75_INVERT_BW
-//   image mirrored left/right .... flip WOLINK75_XFLIP
-//   image flipped top/bottom ..... flip WOLINK75_YFLIP
-//   colour wrong, B/W ok ......... flip WOLINK75_INVERT_COLOR / WOLINK75_PLANE_COLOR_FIRST
-//   bits within byte reversed .... flip WOLINK75_MSB_FIRST
+// 2.13"/3.5" use the proven 2 bpp COLUMN-major layout (4 px/byte MSB-first,
+// map 00=B 01=W 10=Y 11=R) and are left untouched below.
+//
+// 7.5" 800x480 was reverse-engineered on hardware (the manufacturer renders & packs
+// server-side, so the app contains no packing reference). Confirmed: the panel reads
+// 2 bpp ROW-major. Diagnosis history, all reproduced offline by
+// miscellaneous/wolink_ble_protocol/wolink_harness.py:
+//   2bpp column-major   -> "comb teeth"/90-deg + white stipple   (scan transposed)
+//   1bpp dual-plane row -> readable but tiled 2x2, colours wrong (panel is 2bpp not 1bpp)
+//   2bpp ROW-major      -> correct                                <-- default
+// The WOLINK75_* toggles apply to the 7.5" ONLY. If the next flash is off by a single
+// global transform, change ONE, rebuild, flash:
+//   image mirrored left/right .... toggle WOLINK75_XFLIP
+//   image upside down ............ toggle WOLINK75_YFLIP
+//   red and yellow swapped ....... toggle WOLINK75_SWAP_RY
+//   comb-teeth/tiling returns .... you changed ROW_MAJOR/DUAL_PLANE; revert it
 // Returns the produced length, or 0 on failure.
-#define WOLINK75_DUAL_PLANE        1  // 1 = two 1bpp planes (B/W + colour); 0 = legacy 2bpp interleaved
-#define WOLINK75_ROW_MAJOR         1  // 1 = row-major (native 800x480 panel scan); 0 = column-major (small-tag scan)
-#define WOLINK75_PLANE_COLOR_FIRST 0  // 0 = B/W plane first, colour second; 1 = colour first
-#define WOLINK75_INVERT_BW         1  // invert B/W plane bits (panels often want 1=white)
-#define WOLINK75_INVERT_COLOR      0  // invert colour plane bits
-#define WOLINK75_XFLIP             0  // mirror left/right
+#define WOLINK75_DUAL_PLANE        0  // 0 = 2bpp (confirmed); 1 = two 1bpp planes (diagnostic only)
+#define WOLINK75_ROW_MAJOR         1  // 1 = row-major (confirmed for 800x480); 0 = column-major
+#define WOLINK75_XFLIP             1  // mirror left/right (field photo showed an L-R mirror)
 #define WOLINK75_YFLIP             0  // mirror top/bottom
 #define WOLINK75_MSB_FIRST         1  // 1 = MSB-first within byte; 0 = LSB-first
+#define WOLINK75_SWAP_RY           0  // swap red<->yellow (colour-plane interpretation)
+// dual-plane-only knobs (effective when WOLINK75_DUAL_PLANE = 1):
+#define WOLINK75_PLANE_COLOR_FIRST 0
+#define WOLINK75_INVERT_BW         1
+#define WOLINK75_INVERT_COLOR      0
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     PendingItem* queueItem = getQueueItem(address, 0);
     if (queueItem == nullptr) {
@@ -712,15 +716,13 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
 
     memset(buffer, 0, out_len);
 
-#if WOLINK75_DUAL_PLANE
     if (hwType == WOLINK_BLE_EPD_750_BWRY) {
-        // --- experiment: two 1bpp planes (B/W + colour), de-interleaved ---
-        // Output = [planeA (width*height/8) | planeB (width*height/8)] = width*height/4 total.
-        Serial.printf("Wolink 7.5\" dual-plane pack: scan=%s order=%s invBW=%d invC=%d xflip=%d yflip=%d msb=%d\r\n",
-                      WOLINK75_ROW_MAJOR ? "row" : "col",
-                      WOLINK75_PLANE_COLOR_FIRST ? "C,BW" : "BW,C",
-                      WOLINK75_INVERT_BW, WOLINK75_INVERT_COLOR,
-                      WOLINK75_XFLIP, WOLINK75_YFLIP, WOLINK75_MSB_FIRST);
+        // ---- 7.5" 800x480: configurable, defaults to confirmed 2 bpp ROW-major ----
+#if WOLINK75_DUAL_PLANE
+        // Diagnostic only: two 1bpp planes (B/W + colour), de-interleaved.
+        Serial.printf("Wolink 7.5\" pack: DUAL-PLANE scan=%s order=%s invBW=%d invC=%d xflip=%d yflip=%d msb=%d\r\n",
+                      WOLINK75_ROW_MAJOR ? "row" : "col", WOLINK75_PLANE_COLOR_FIRST ? "C,BW" : "BW,C",
+                      WOLINK75_INVERT_BW, WOLINK75_INVERT_COLOR, WOLINK75_XFLIP, WOLINK75_YFLIP, WOLINK75_MSB_FIRST);
         const uint32_t out_plane = (uint32_t)width * (uint32_t)height / 8;  // one 1bpp plane
         uint8_t* bwPlane    = WOLINK75_PLANE_COLOR_FIRST ? (buffer + out_plane) : buffer;
         uint8_t* colorPlane = WOLINK75_PLANE_COLOR_FIRST ? buffer : (buffer + out_plane);
@@ -729,19 +731,16 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             for (int y = 0; y < height; y++) {
                 uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
                 uint8_t mask = 0x80 >> (y % 8);
-                uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;                 // black|yellow
-                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;    // red|yellow
+                uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
+                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
                 uint8_t bw    = WOLINK75_INVERT_BW    ? (p1 ? 0 : 1) : p1;
                 uint8_t color = WOLINK75_INVERT_COLOR ? (p2 ? 0 : 1) : p2;
                 int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
-                uint32_t ob;
-                uint8_t omask;
+                uint32_t ob; uint8_t omask;
                 if (WOLINK75_ROW_MAJOR) {
-                    // native 800x480 scan: row-major, byte holds 8 horizontal pixels
                     ob = (uint32_t)phy_y * ((uint32_t)width / 8) + (phy_x / 8);
                     omask = WOLINK75_MSB_FIRST ? (0x80 >> (phy_x % 8)) : (uint8_t)(1 << (phy_x % 8));
                 } else {
-                    // small-tag scan: column-major, byte holds 8 vertical pixels
                     ob = (uint32_t)phy_x * ((uint32_t)height / 8) + (phy_y / 8);
                     omask = WOLINK75_MSB_FIRST ? (0x80 >> (phy_y % 8)) : (uint8_t)(1 << (phy_y % 8));
                 }
@@ -749,24 +748,49 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                 if (color) colorPlane[ob] |= omask;
             }
         }
+#else
+        // Confirmed format: 2 bpp, ROW-major, 4 px/byte, map 00=B 01=W 10=Y 11=R.
+        Serial.printf("Wolink 7.5\" pack: 2BPP scan=%s xflip=%d yflip=%d msb=%d swapRY=%d\r\n",
+                      WOLINK75_ROW_MAJOR ? "row" : "col", WOLINK75_XFLIP, WOLINK75_YFLIP,
+                      WOLINK75_MSB_FIRST, WOLINK75_SWAP_RY);
+        for (int x = 0; x < width; x++) {
+            int phy_x = WOLINK75_XFLIP ? (width - 1 - x) : x;
+            for (int y = 0; y < height; y++) {
+                uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
+                uint8_t mask = 0x80 >> (y % 8);
+                uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
+                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
+                if (WOLINK75_SWAP_RY && p2) p1 ^= 1;                 // red<->yellow
+                uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
+                int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
+                uint32_t ob; int sh;
+                if (WOLINK75_ROW_MAJOR) {
+                    ob = (uint32_t)phy_y * ((uint32_t)width / 4) + (phy_x / 4);
+                    sh = WOLINK75_MSB_FIRST ? (6 - (phy_x % 4) * 2) : ((phy_x % 4) * 2);
+                } else {
+                    ob = (uint32_t)phy_x * ((uint32_t)height / 4) + (phy_y / 4);
+                    sh = WOLINK75_MSB_FIRST ? (6 - (phy_y % 4) * 2) : ((phy_y % 4) * 2);
+                }
+                buffer[ob] |= color << sh;
+            }
+        }
+#endif
         return out_len;
     }
-#endif
 
-    // --- legacy 2 bpp interleaved (2.13"/3.5", proven; 7.5" only if DUAL_PLANE=0) ---
+    // ---- 2.13"/3.5": proven 2 bpp column-major, both axes flipped (unchanged) ----
     for (int x = 0; x < width; x++) {
-        int phy_x = (width - 1) - x;                  // Wolink RAM is x-flipped too
+        int phy_x = (width - 1) - x;
         for (int y = 0; y < height; y++) {
             uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
             uint8_t mask = 0x80 >> (y % 8);
             uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;                 // B/W plane
             uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;    // color plane
-            // Match the Phase 1 (GICisky BWRY) mapping: hi=p2, lo=~p1.
             // black (1,0)->00, white (0,0)->01, red (0,1)->11, yellow (1,1)->10.
             uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
-            int phy_y = (height - 1) - y;                  // Wolink RAM is y-flipped
+            int phy_y = (height - 1) - y;
             uint32_t out_byte = (uint32_t)phy_x * (height / 4) + (phy_y / 4);
-            int out_shift = 6 - (phy_y % 4) * 2;           // MSB-first within byte
+            int out_shift = 6 - (phy_y % 4) * 2;
             buffer[out_byte] |= color << out_shift;
         }
     }

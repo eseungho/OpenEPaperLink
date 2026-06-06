@@ -629,11 +629,14 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 }
 
 // Pack the dual-bitplane source produced by makeimage into the Wolink/Zhsunyco
-// 2 bpp single-plane RAM layout. Source planes are width*byte_per_line bytes
-// each, ordered column-major (same convention compress_image() relies on).
-// Output: width * (height/4) bytes, column-major, y-axis flipped, 4 pixels per
-// byte MSB-first, color map 00=B 01=W 10=Y 11=R. width/height are picked from
-// the tag's hwType so the same routine handles every Wolink variant.
+// RAM layout. Source planes are width*byte_per_line bytes each, ordered
+// column-major (same convention compress_image() relies on). width/height are
+// picked from the tag's hwType so one routine handles every Wolink variant.
+// Two output formats, selected by hwType:
+//   2.13"/3.5": one 2bpp plane, width*(height/4) bytes, column-major, x/y
+//               flipped, 4 px/byte MSB-first, color map 00=B 01=W 10=Y 11=R.
+//   7.5":       two 1bpp planes, 2*(width*height/8) bytes, row-major (see the
+//               dual_plane branch). Inferred format, tunable via the W75_* knobs.
 // Returns the produced length, or 0 on failure.
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     PendingItem* queueItem = getQueueItem(address, 0);
@@ -677,7 +680,16 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
     }
     const uint32_t byte_per_line = (uint32_t)height / 8;
     const uint32_t plane_size = (uint32_t)width * byte_per_line;
-    const uint32_t out_len = (uint32_t)width * ((uint32_t)height / 4);
+    // The 2.13"/3.5" take one 2bpp plane (width * height/4 bytes). The 7.5"
+    // 800x480 controller does NOT: a uniform white image came back as a fine
+    // stripe pattern, which is exactly what happens when our 2bpp white byte
+    // (0x55) is read as a 1bpp plane (0101...). So the 7.5" expects TWO 1bpp
+    // full-screen planes (a black/white plane and a red/yellow plane), not
+    // 4 px/byte. Inferred without a reference capture -- see knobs below.
+    const bool dual_plane = (hwType == WOLINK_BLE_EPD_750_BWRY);
+    const uint32_t out_len = dual_plane
+                                 ? 2u * plane_size                            // two 1bpp planes
+                                 : (uint32_t)width * ((uint32_t)height / 4);  // one 2bpp plane
 
     if (out_len > max_len) {
         Serial.printf("Wolink pack: buffer too small (%u < %u)\r\n",
@@ -691,6 +703,45 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
     }
 
     memset(buffer, 0, out_len);
+
+    if (dual_plane) {
+        // EXPERIMENTAL inferred 7.5" format: two 1bpp planes, row-major,
+        // 8 px/byte, MSB = leftmost pixel. Each pixel's proven 2-bit code
+        // (B=00 W=01 Y=10 R=11) is split into its two bitplanes -- lo = code&1
+        // (set for White/Red), hi = code>>1 (set for Yellow/Red) -- which
+        // together still encode all four colors. If hardware disagrees, flip
+        // ONE knob at a time and reflash (each is a single 0/1):
+        //   _LO_PLANE_FIRST : which plane is sent first
+        //   _INVERT_LO/_HI  : bit polarity of each plane (fixes inverted/odd colors)
+        //   _FLIP_X/_FLIP_Y : mirror if the image is reversed L/R or up/down
+        const int W75_LO_PLANE_FIRST = 1;
+        const int W75_INVERT_LO      = 0;
+        const int W75_INVERT_HI      = 0;
+        const int W75_FLIP_X         = 0;
+        const int W75_FLIP_Y         = 0;
+        uint8_t* loPlane = buffer + (W75_LO_PLANE_FIRST ? 0 : plane_size);
+        uint8_t* hiPlane = buffer + (W75_LO_PLANE_FIRST ? plane_size : 0);
+        for (int x = 0; x < width; x++) {
+            for (int y = 0; y < height; y++) {
+                uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
+                uint8_t mask = 0x80 >> (y % 8);
+                uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;              // makeimage B/W plane
+                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0; // makeimage color plane
+                uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);  // B=00 W=01 Y=10 R=11
+                uint8_t lo = (uint8_t)((color & 1) ^ W75_INVERT_LO);
+                uint8_t hi = (uint8_t)(((color >> 1) & 1) ^ W75_INVERT_HI);
+                int px = W75_FLIP_X ? (width - 1 - x) : x;
+                int py = W75_FLIP_Y ? (height - 1 - y) : y;
+                uint32_t idx = (uint32_t)py * width + px;       // row-major along width
+                uint32_t out_byte = idx >> 3;
+                uint8_t out_bit = 0x80 >> (idx & 7);            // MSB = leftmost pixel
+                if (lo) loPlane[out_byte] |= out_bit;
+                if (hi) hiPlane[out_byte] |= out_bit;
+            }
+        }
+        return out_len;
+    }
+
     for (int x = 0; x < width; x++) {
         int phy_x = (width - 1) - x;                  // Wolink RAM is x-flipped too
         for (int y = 0; y < height; y++) {

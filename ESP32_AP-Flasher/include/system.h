@@ -18,3 +18,4 @@ void logLine(const String& text);
 // Like logLine(), but gives up after timeoutMs instead of waiting forever for the filesystem mutex.
 bool tryLogLine(const String& text, uint32_t timeoutMs);
 void logStartUp();
+void logCoreDump();

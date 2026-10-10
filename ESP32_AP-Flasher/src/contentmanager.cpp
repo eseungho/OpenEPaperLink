@@ -60,7 +60,9 @@ void contentRunner() {
     WiFi.macAddress(wifimac);
     memset(&wifimac[6], 0, 2);
 
-    for (tagRecord *taginfo : tagDB) {
+    freeDeletedRecords();
+    // iterate over a copy: drawNew() can take seconds and must not hold the tagDB lock
+    for (tagRecord *taginfo : tagDBSnapshot()) {
         // One pass can render (and fetch data for) many tags; report progress per tag, not per pass, and let a pending
         // reboot run its shutdown (DB save) without waiting for the whole pass.
         supervisorHeartbeat(SUPERVISED_LOOP);
@@ -107,7 +109,7 @@ void contentRunner() {
 
 void checkVars() {
     JsonDocument cfgobj;
-    for (tagRecord *tag : tagDB) {
+    for (tagRecord *tag : tagDBSnapshot()) {
         if (tag->contentMode == 19) {
             deserializeJson(cfgobj, tag->modeConfigJson);
             const String jsonfile = cfgobj["filename"].as<String>();

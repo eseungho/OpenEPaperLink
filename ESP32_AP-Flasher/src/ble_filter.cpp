@@ -366,8 +366,7 @@ bool BLE_filter_add_device(const BLE_ScanRecord& device) {
 }
 
 bool BLE_is_image_pending(uint8_t address[8]) {
-    for (int16_t c = 0; c < tagDB.size(); c++) {
-        tagRecord* taginfo = tagDB.at(c);
+    for (tagRecord* taginfo : tagDBSnapshot()) {
         if (taginfo->pendingCount > 0 && taginfo->version == 0 &&
             (((taginfo->hwType & 0xF0) == 0xB0) ||
              (taginfo->hwType == WOLINK_BLE_EPD_213_BWRY) ||
@@ -381,8 +380,7 @@ bool BLE_is_image_pending(uint8_t address[8]) {
             return true;
         }
     }
-    for (int16_t c = 0; c < tagDB.size(); c++) {
-        tagRecord* taginfo = tagDB.at(c);
+    for (tagRecord* taginfo : tagDBSnapshot()) {
         if (taginfo->pendingCount > 0 && taginfo->version == 0 && (taginfo->mac[7] == 0x13) && (taginfo->mac[6] == 0x37)) {
             memcpy(address, taginfo->mac, 8);
             Serial.printf("ATC BLE OEPL data Waiting\r\n");

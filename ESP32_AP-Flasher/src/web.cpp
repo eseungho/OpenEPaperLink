@@ -57,6 +57,7 @@ void wsErr(const String &text) {
 }
 
 size_t dbSize() {
+    TagDBLock lock;
     size_t size = tagDB.size() * sizeof(tagRecord);
     for (auto &tag : tagDB) {
         if (tag->data) {
@@ -405,8 +406,7 @@ void init_web() {
                     if (strcmp(cmdValue, "purge") == 0) {
                         time_t now;
                         time(&now);
-                        for (int c = tagDB.size() - 1; c >= 0; --c) {
-                            tagRecord *tag = tagDB.at(c);
+                        for (tagRecord *tag : tagDBSnapshot()) {
                             if (tag->expectedNextCheckin == 3216153600 || tag->lastseen < now - 24 * 3600 || now > tag->expectedNextCheckin + 600) {
                                 wsSendTaginfo(tag->mac, SYNC_DELETE);
                                 deleteRecord(tag->mac);

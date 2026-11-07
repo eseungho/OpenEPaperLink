@@ -2,7 +2,8 @@
 #include <Arduino.h>
 #include <FS.h>
 
-#include "BLEDevice.h"
+#include "ble_filter.h"
+#include "ble_writer.h"
 #include "newproto.h"
 #include "serialap.h"
 #include "settings.h"
@@ -105,31 +106,56 @@ struct BleAdvDataStructV2 {
     uint8_t counter;
 } __packed;
 
-bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
-    Serial.print("BLE Advertised Device found: ");
-    Serial.println(advertisedDevice.toString().c_str());
+// Bluedroid's BLEAddress::getNative() gave the address most significant byte first, and the MACs of all BLE tags in
+// tagDB were derived from that order. NimBLE keeps addresses least significant byte first, so the old order is
+// rebuilt here; otherwise every existing BLE tag would show up again under a different MAC.
+static void BLE_addressMsbFirst(const BLE_ScanRecord& device, uint8_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = device.addr[5 - i];
+}
+
+// Manufacturer-specific data (AD type 0xFF, company id included) as the Bluedroid library reported it: the last such
+// field across advertisement and scan response. Returns its length, or -1 if there is none.
+static int BLE_findManufacturerData(const BLE_ScanRecord& device, const uint8_t** data) {
+    int found = -1;
+    *data = nullptr;
+    for (int i = 0; i < device.payloadLen;) {
+        const uint8_t len = device.payload[i];
+        if (len == 0) {  // padding
+            i++;
+            continue;
+        }
+        if (i + 1 + len > device.payloadLen) break;  // truncated field
+        if (device.payload[i + 1] == 0xFF) {
+            *data = &device.payload[i + 2];
+            found = len - 1;
+        }
+        i += 1 + len;
+    }
+    return found;
+}
+
+// Called from BLETask for every device found by the last scan (once per device and scan).
+bool BLE_filter_add_device(const BLE_ScanRecord& device) {
+    Serial.printf("BLE Advertised Device found: %02x:%02x:%02x:%02x:%02x:%02x, rssi %d\r\n", device.addr[5], device.addr[4],
+                  device.addr[3], device.addr[2], device.addr[1], device.addr[0], device.rssi);
 
     uint8_t payloadData[100];
-    int payloadDatalen = advertisedDevice.getPayloadLength();
-    memcpy(&payloadData, (uint8_t*)advertisedDevice.getPayload(), payloadDatalen);
+    const int payloadDatalen = device.payloadLen < sizeof(payloadData) ? device.payloadLen : sizeof(payloadData);
+    memcpy(&payloadData, device.payload, payloadDatalen);
     Serial.printf(" Payload data: ");
     for (int i = 0; i < payloadDatalen; i++)
         Serial.printf("%02X", payloadData[i]);
     Serial.printf("\r\n");
 
-    if (advertisedDevice.haveManufacturerData()) {
-        int manuDatalen = advertisedDevice.getManufacturerData().length();
+    const uint8_t* manufacturerData = nullptr;
+    const int manuDatalen = BLE_findManufacturerData(device, &manufacturerData);
+    if (manufacturerData != nullptr) {
         uint8_t manuData[100];
         if (manuDatalen > sizeof(manuData))
             return false;  // Manu data too big, could never happen but better make sure here
-#if ESP_ARDUINO_VERSION_MAJOR == 2
-        memcpy(&manuData, (uint8_t*)advertisedDevice.getManufacturerData().data(), manuDatalen);
-#else
-        // [Nic] suggested fix for arduino 3.x by copilot, but I cannot test it
-        memcpy(&manuData, (uint8_t*)advertisedDevice.getManufacturerData().c_str(), manuDatalen);
-#endif
-        Serial.printf(" Address type: %02X Manu data: ", advertisedDevice.getAddressType());
-        for (int i = 0; i < advertisedDevice.getManufacturerData().length(); i++)
+        memcpy(&manuData, manufacturerData, manuDatalen);
+        Serial.printf(" Address type: %02X Manu data: ", device.addrType);
+        for (int i = 0; i < manuDatalen; i++)
             Serial.printf("%02X", manuData[i]);
         Serial.printf("\r\n");
         if (manuDatalen == 7 && manuData[0] == 0x53 && manuData[1] == 0x50) {  // Lets check for a Gicisky E-Paper display
@@ -138,7 +164,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
 
             uint8_t macReversed[6];
-            memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+            BLE_addressMsbFirst(device, macReversed);
             theAdvData.src[0] = macReversed[5];
             theAdvData.src[1] = macReversed[4];
             theAdvData.src[2] = macReversed[3];
@@ -148,12 +174,13 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.src[6] = manuData[2];  // We use this do find out what type of display we got for compression^^
             theAdvData.src[7] = manuData[6];
             theAdvData.adr.batteryMv = manuData[3] * 100;
-            theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
-            theAdvData.adr.lastPacketLQI = advertisedDevice.getRSSI();
+            theAdvData.adr.lastPacketRSSI = device.rssi;
+            theAdvData.adr.lastPacketLQI = device.rssi;
             theAdvData.adr.hwType = gicToOEPLtype(manuData[2]);
             theAdvData.adr.tagSoftwareVersion = manuData[4] << 8 | manuData[5];
             theAdvData.adr.capabilities = 0x00;
 
+            BLE_rememberAddressType(theAdvData.src, device.addrType);
             processDataReq(&theAdvData, true);
             return true;
         } else if (manuDatalen >= 3 && manuData[0] == 0x37 && manuData[1] == 0x13) {  // Lets check for a Gicisky E-Paper display
@@ -176,7 +203,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
                         Serial.printf("battery_mv %u\r\n", inAdvData.battery_mv);
                         Serial.printf("counter %u\r\n", inAdvData.counter);*/
                         theAdvData.adr.batteryMv = inAdvData.battery_mv;
-                        theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
+                        theAdvData.adr.lastPacketRSSI = device.rssi;
                         theAdvData.adr.hwType = inAdvData.hw_type & 0xff;
                         theAdvData.adr.tagSoftwareVersion = inAdvData.fw_version;
                         theAdvData.adr.capabilities = inAdvData.capabilities & 0xff;
@@ -200,7 +227,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
                         Serial.printf("counter %u\r\n", inAdvData.counter);*/
                         theAdvData.adr.batteryMv = inAdvData.battery_mv;
                         theAdvData.adr.temperature = inAdvData.temperature;
-                        theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
+                        theAdvData.adr.lastPacketRSSI = device.rssi;
                         theAdvData.adr.hwType = inAdvData.hw_type & 0xff;
                         theAdvData.adr.tagSoftwareVersion = inAdvData.fw_version;
                         theAdvData.adr.capabilities = inAdvData.capabilities & 0xff;
@@ -215,7 +242,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
                     break;
             }
             uint8_t macReversed[6];
-            memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+            BLE_addressMsbFirst(device, macReversed);
             theAdvData.src[0] = macReversed[5];
             theAdvData.src[1] = macReversed[4];
             theAdvData.src[2] = macReversed[3];
@@ -224,6 +251,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.src[5] = macReversed[0];
             theAdvData.src[6] = manuData[0];  // We use this do find out what type of display we got for compression^^
             theAdvData.src[7] = manuData[1];
+            BLE_rememberAddressType(theAdvData.src, device.addrType);
             processDataReq(&theAdvData, true);
             return true;
         }
@@ -254,7 +282,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             struct espAvailDataReq theAdvData;
             memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
             uint8_t macReversed[6];
-            memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+            BLE_addressMsbFirst(device, macReversed);
             theAdvData.src[0] = macReversed[5];
             theAdvData.src[1] = macReversed[4];
             theAdvData.src[2] = macReversed[3];
@@ -264,11 +292,12 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.src[6] = manuData[4];  // model byte (BE high)
             theAdvData.src[7] = manuData[5];  // model byte (BE low)
             theAdvData.adr.batteryMv = battMv;
-            theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
-            theAdvData.adr.lastPacketLQI = advertisedDevice.getRSSI();
+            theAdvData.adr.lastPacketRSSI = device.rssi;
+            theAdvData.adr.lastPacketLQI = device.rssi;
             theAdvData.adr.hwType = hwType;
             theAdvData.adr.tagSoftwareVersion = (manuData[6] << 8) | manuData[7];
             theAdvData.adr.capabilities = 0x00;
+            BLE_rememberAddressType(theAdvData.src, device.addrType);
             processDataReq(&theAdvData, true);
             return true;
         }
@@ -285,7 +314,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             struct espAvailDataReq theAdvData;
             memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
             uint8_t macReversed[6];
-            memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+            BLE_addressMsbFirst(device, macReversed);
             theAdvData.src[0] = macReversed[5];
             theAdvData.src[1] = macReversed[4];
             theAdvData.src[2] = macReversed[3];
@@ -294,12 +323,13 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.src[5] = macReversed[0];
             theAdvData.src[6] = 0x00;  // dispatch is via hwType, not last-MAC bytes
             theAdvData.src[7] = 0x00;
-            theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
-            theAdvData.adr.lastPacketLQI  = advertisedDevice.getRSSI();
+            theAdvData.adr.lastPacketRSSI = device.rssi;
+            theAdvData.adr.lastPacketLQI  = device.rssi;
             theAdvData.adr.hwType = NEMONIC_BLE_MIP201;  // 0xE6
             theAdvData.adr.tagSoftwareVersion = 0;
             theAdvData.adr.capabilities = 0x00;  // matches Wolink/Gicisky convention (8-bit field)
             theAdvData.adr.batteryMv = 0;  // not in advertisement; query via 1C 76 31 later if needed
+            BLE_rememberAddressType(theAdvData.src, device.addrType);
             processDataReq(&theAdvData, true);
             return true;
         }
@@ -307,7 +337,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
     }
     if (payloadDatalen >= 17) {  // Lets check for an ATC Mi Thermometer
         uint8_t macReversed[6];
-        memcpy(&macReversed, (uint8_t*)advertisedDevice.getAddress().getNative(), 6);
+        BLE_addressMsbFirst(device, macReversed);
         if (payloadData[9] == macReversed[5] && payloadData[8] == macReversed[4] && payloadData[7] == macReversed[3]) {  // Here we found an ATC Mi Thermometer
             struct espAvailDataReq theAdvData;
             memset((uint8_t*)&theAdvData, 0x00, sizeof(espAvailDataReq));
@@ -323,7 +353,7 @@ bool BLE_filter_add_device(BLEAdvertisedDevice advertisedDevice) {
             theAdvData.adr.batteryMv = payloadData[14] << 8 | payloadData[15];
             theAdvData.adr.temperature = (payloadData[10] << 8 | payloadData[11]) / 10;
             theAdvData.adr.lastPacketLQI = payloadData[12];
-            theAdvData.adr.lastPacketRSSI = advertisedDevice.getRSSI();
+            theAdvData.adr.lastPacketRSSI = device.rssi;
             theAdvData.adr.hwType = ATC_MI_THERMOMETER;
             theAdvData.adr.tagSoftwareVersion = 0x00;
             theAdvData.adr.capabilities = 0x00;

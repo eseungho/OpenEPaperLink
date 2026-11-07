@@ -126,7 +126,8 @@ void wsSendSysteminfo() {
     setVarDB("ap_ch", String(apInfo.channel));
 #endif
 
-    // reboot once at night
+#ifndef HAS_SUPERVISOR
+    // reboot once at night (with HAS_SUPERVISOR, the supervisor task does this independently of this function)
     if (timeinfo.tm_hour == 3 && timeinfo.tm_min == 56 && millis() > 2 * 3600 * 1000 && config.nightlyreboot == 1) {
         logLine("Nightly reboot");
         wsErr("REBOOTING");
@@ -139,6 +140,7 @@ void wsSendSysteminfo() {
         delay(100);
         ESP.restart();
     }
+#endif
 
     static uint32_t tagcounttimer = 0;
     if (millis() - tagcounttimer > 60000 || tagcounttimer == 0) {

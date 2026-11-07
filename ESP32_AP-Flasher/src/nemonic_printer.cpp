@@ -3,17 +3,20 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
-#include "BLEDevice.h"
+#include <NimBLEDevice.h>
+
+#include "ble_writer.h"
 #include "nemonic_printer.h"
 #include "nemonic_raster.h"
 #include "newproto.h"
 #include "storage.h"
+#include "supervisor.h"
 #include "tag_db.h"
 
 // GATT UUIDs from Nemonic SDK (Nemonic.js:40-48).
-static BLEUUID nemonicServiceUUID("3b790000-923e-4f69-b794-74f07d000000");
-static BLEUUID nemonicNotifyUUID ("3b790001-923e-4f69-b794-74f07d000000");
-static BLEUUID nemonicWriteUUID  ("3b790002-923e-4f69-b794-74f07d000000");
+static NimBLEUUID nemonicServiceUUID("3b790000-923e-4f69-b794-74f07d000000");
+static NimBLEUUID nemonicNotifyUUID ("3b790001-923e-4f69-b794-74f07d000000");
+static NimBLEUUID nemonicWriteUUID  ("3b790002-923e-4f69-b794-74f07d000000");
 
 // Shared with ble_writer.cpp.
 extern bool BLE_connected;
@@ -23,7 +26,7 @@ static volatile bool nemonic_ack_ready = false;
 static volatile uint8_t nemonic_ack_buf[16] = {0};
 static volatile uint8_t nemonic_ack_len = 0;
 
-static void nemonicNotifyCb(BLERemoteCharacteristic*, uint8_t* data, size_t length, bool) {
+static void nemonicNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t length, bool) {
     size_t n = length < sizeof(nemonic_ack_buf) ? length : sizeof(nemonic_ack_buf);
     for (size_t i = 0; i < n; i++) nemonic_ack_buf[i] = data[i];
     nemonic_ack_len = (uint8_t)n;
@@ -33,24 +36,40 @@ static void nemonicNotifyCb(BLERemoteCharacteristic*, uint8_t* data, size_t leng
     Serial.println();
 }
 
-class NemonicClientCallback : public BLEClientCallbacks {
-    void onConnect(BLEClient*) override {
+class NemonicClientCallback : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient*) override {
         Serial.println("Nemonic BLE onConnect");
         BLE_connected = true;
     }
-    void onDisconnect(BLEClient* c) override {
-        Serial.println("Nemonic BLE onDisconnect");
-        c->disconnect();
+    void onDisconnect(NimBLEClient*, int reason) override {
+        Serial.printf("Nemonic BLE onDisconnect, reason %d\r\n", reason);
         BLE_connected = false;
     }
 };
 
-static void nemonic_write_chunked(BLERemoteCharacteristic* c, const uint8_t* data, uint32_t len) {
-    for (uint32_t off = 0; off < len; off += NEMONIC_BLE_CHUNK) {
-        uint32_t n = (len - off) < NEMONIC_BLE_CHUNK ? (len - off) : NEMONIC_BLE_CHUNK;
-        c->writeValue((uint8_t*)(data + off), n, false);  // write without response
+// One instance for all prints; this used to be `new`-ed (and leaked) per print.
+static NemonicClientCallback nemonicClientCallbacks;
+
+// Chunk size of the write-without-response stream: NEMONIC_BLE_CHUNK (MTU 247) unless the negotiated MTU is smaller.
+static uint16_t nemonic_chunk = NEMONIC_BLE_CHUNK;
+
+// Writes without response fail at once while NimBLE's transmit buffers are full. Wait and retry the same chunk then,
+// instead of skipping it, which would corrupt the frame and cost an 8.5 s ACK timeout per attempt.
+static bool nemonic_write_chunked(NimBLERemoteCharacteristic* c, const uint8_t* data, uint32_t len) {
+    for (uint32_t off = 0; off < len; off += nemonic_chunk) {
+        const uint32_t n = (len - off) < nemonic_chunk ? (len - off) : nemonic_chunk;
+        uint16_t tries = 0;
+        while (!c->writeValue(data + off, n, false)) {  // write without response
+            if (!BLE_connected || ++tries > 100) {
+                Serial.printf("Nemonic: write failed at %u/%u\r\n", (unsigned)off, (unsigned)len);
+                return false;
+            }
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+        if (((off / nemonic_chunk) & 63) == 63) supervisorHeartbeat(SUPERVISED_BLE);  // frames are up to 64 KB
         if (off + n < len) vTaskDelay(10 / portTICK_PERIOD_MS);
     }
+    return true;
 }
 
 static bool nemonic_wait_ack(uint32_t timeoutMs) {
@@ -152,17 +171,14 @@ bool nemonic_upload(uint8_t address[8]) {
         return false;
     }
 
-    // 5) BLE connect. MAC byte order: tag_db stores LSB-first in last 6 bytes,
-    //    BLE stack wants MSB-first.
+    // 5) BLE connect. tag_db stores the address LSB-first; BLE_tagAddress() converts it, this is just for the log.
     uint8_t reversed[6] = { address[5], address[4], address[3], address[2], address[1], address[0] };
     Serial.printf("Nemonic connecting to %02X:%02X:%02X:%02X:%02X:%02X\r\n",
                   reversed[0], reversed[1], reversed[2], reversed[3], reversed[4], reversed[5]);
 
-    BLEClient* client = BLEDevice::createClient();
-    client->setClientCallbacks(new NemonicClientCallback());
-    if (!client->connect(BLEAddress(reversed))) {
+    NimBLEClient* client = BLE_getClient(&nemonicClientCallbacks);
+    if (client == nullptr || !client->connect(BLE_tagAddress(address), true)) {
         Serial.println("Nemonic: connect() returned false");
-        client->disconnect();
         free(frameBuf);
         return false;
     }
@@ -174,33 +190,42 @@ bool nemonic_upload(uint8_t address[8]) {
         free(frameBuf);
         return false;
     }
-    if (!client->setMTU(247)) {
-        Serial.println("Nemonic: MTU negotiation failed (continuing)");
+    // NimBLE negotiates up to 255 on connect. Chunks longer than MTU-3 would become long writes, which NimBLE
+    // silently truncates if the printer rejects them, so size them from the MTU.
+    const uint16_t mtu = BLE_waitForMtu(client, 3000);
+    if (mtu < 100) {
+        Serial.printf("Nemonic: MTU %u too small\r\n", mtu);
+        client->disconnect();
+        free(frameBuf);
+        return false;
     }
+    nemonic_chunk = (mtu - 3) < NEMONIC_BLE_CHUNK ? (mtu - 3) : NEMONIC_BLE_CHUNK;
 
-    BLERemoteService* svc = client->getService(nemonicServiceUUID);
+    NimBLERemoteService* svc = client->getService(nemonicServiceUUID);
     if (svc == nullptr) {
         Serial.println("Nemonic: service not found");
         client->disconnect();
         free(frameBuf);
         return false;
     }
-    BLERemoteCharacteristic* writeChar  = svc->getCharacteristic(nemonicWriteUUID);
-    BLERemoteCharacteristic* notifyChar = svc->getCharacteristic(nemonicNotifyUUID);
+    NimBLERemoteCharacteristic* writeChar  = svc->getCharacteristic(nemonicWriteUUID);
+    NimBLERemoteCharacteristic* notifyChar = svc->getCharacteristic(nemonicNotifyUUID);
     if (writeChar == nullptr || notifyChar == nullptr) {
         Serial.println("Nemonic: characteristic discovery failed");
         client->disconnect();
         free(frameBuf);
         return false;
     }
-    if (notifyChar->canNotify()) {
-        nemonic_ack_ready = false;
-        notifyChar->registerForNotify(nemonicNotifyCb);
-    } else {
+    nemonic_ack_ready = false;
+    if (!notifyChar->canNotify()) {
         Serial.println("Nemonic: notify characteristic does not support notify");
         client->disconnect();
         free(frameBuf);
         return false;
+    }
+    if (!notifyChar->subscribe(true, nemonicNotifyCb)) {
+        // registerForNotify() ignored a failed CCCD write too; notifications may still arrive.
+        Serial.println("Nemonic: notify subscription failed (continuing)");
     }
 
     auto fail = [&](const char* why) {
@@ -213,14 +238,14 @@ bool nemonic_upload(uint8_t address[8]) {
     // 6) INIT
     {
         uint8_t init[2] = { 0x1B, 0x40 };
-        nemonic_write_chunked(writeChar, init, sizeof(init));
+        if (!nemonic_write_chunked(writeChar, init, sizeof(init))) return fail("INIT write failed");
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
     // 7) SET_COPIES
     {
         uint8_t setc[3] = { 0x1B, 0x43, opts.copies };
-        nemonic_write_chunked(writeChar, setc, sizeof(setc));
+        if (!nemonic_write_chunked(writeChar, setc, sizeof(setc))) return fail("SET_COPIES write failed");
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
@@ -251,7 +276,8 @@ bool nemonic_upload(uint8_t address[8]) {
                       (unsigned)thisLen, (unsigned)frameLen);
 
         nemonic_ack_ready = false;
-        nemonic_write_chunked(writeChar, frameBuf, frameLen);
+        if (!nemonic_write_chunked(writeChar, frameBuf, frameLen)) return fail("frame write failed");
+        supervisorHeartbeat(SUPERVISED_BLE);  // long labels are many frames, each waiting up to 8.5 s for an ACK
 
         if (!nemonic_wait_ack(8500)) {
             return fail("ACK timeout for split frame");
@@ -266,7 +292,7 @@ bool nemonic_upload(uint8_t address[8]) {
     // 9) PRINT (cut or no-cut), or skip if debug noprint set.
     if (!opts.noprint) {
         uint8_t printCmd[2] = { 0x1B, (uint8_t)(opts.cut ? 0x50 : 0x51) };
-        nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd));
+        if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) return fail("PRINT write failed");
         vTaskDelay(50 / portTICK_PERIOD_MS);
     } else {
         Serial.println("Nemonic: noprint=1, skipping final PRINT");

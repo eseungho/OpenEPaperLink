@@ -6,6 +6,7 @@
 #include <esp_sntp.h>
 
 #include "storage.h"
+#include "supervisor.h"
 #include "tag_db.h"
 #include "wifimanager.h"
 
@@ -41,15 +42,17 @@ void logLine(const char* buffer) {
     logLine(String(buffer));
 }
 
-void logLine(const String& text) {
+static bool writeLogLine(const String& text, TickType_t wait) {
     time_t now;
     time(&now);
 
     char timeStr[24];
     const char* format = (now < (time_t)1672531200) ? "           %H:%M:%S " : "%Y-%m-%d %H:%M:%S ";
-    strftime(timeStr, sizeof(timeStr), format, localtime(&now));
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    strftime(timeStr, sizeof(timeStr), format, &timeinfo);
 
-    xSemaphoreTake(fsMutex, portMAX_DELAY);
+    if (xSemaphoreTake(fsMutex, wait) != pdTRUE) return false;
     File logFile = contentFS->open("/log.txt", "a");
     if (logFile) {
         if (logFile.size() >= 10 * 1024) {
@@ -59,7 +62,7 @@ void logLine(const String& text) {
             logFile = contentFS->open("/log.txt", "a");
             if (!logFile) {
                 xSemaphoreGive(fsMutex);
-                return;
+                return false;
             }
         }
 
@@ -68,6 +71,16 @@ void logLine(const String& text) {
         logFile.close();
     }
     xSemaphoreGive(fsMutex);
+    return true;
+}
+
+void logLine(const String& text) {
+    writeLogLine(text, portMAX_DELAY);
+}
+
+bool tryLogLine(const String& text, uint32_t timeoutMs) {
+    if (fsMutex == nullptr || contentFS == nullptr) return false;
+    return writeLogLine(text, pdMS_TO_TICKS(timeoutMs));
 }
 
 void logStartUp() {
@@ -111,4 +124,7 @@ void logStartUp() {
     }
 
     logLine(logEntry);
+
+    const String supervisorReport = supervisorBootReport();
+    if (supervisorReport.length()) logLine(supervisorReport);
 }

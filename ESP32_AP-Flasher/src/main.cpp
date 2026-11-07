@@ -11,6 +11,7 @@
 #include "serialap.h"
 #include "settings.h"
 #include "storage.h"
+#include "supervisor.h"
 #include "system.h"
 #include "tag_db.h"
 #include "tagdata.h"
@@ -95,6 +96,8 @@ void setup() {
 #endif
 
     Storage.begin();
+    // Armed after Storage.begin() on purpose: a first-boot LittleFS format can legitimately take minutes.
+    supervisorEarlyInit();
 
     /*
     Serial.println("\n\n##################################");
@@ -181,9 +184,11 @@ void setup() {
 
     wsSendSysteminfo();
     util::printHeap();
+    supervisorStart();
 }
 
 void loop() {
+    supervisorLoopTick();
     ws.cleanupClients();
     wm.poll();
 

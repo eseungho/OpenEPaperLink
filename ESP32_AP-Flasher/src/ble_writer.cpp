@@ -1,9 +1,9 @@
 #ifdef HAS_BLE_WRITER
 #include <Arduino.h>
 #include <MD5Builder.h>
+#include <NimBLEDevice.h>
 #include <mbedtls/aes.h>
 
-#include "BLEDevice.h"
 #include "ble_filter.h"
 #include "ble_writer.h"
 #include "newproto.h"
@@ -48,28 +48,27 @@ struct blockRequest BLEblkRequst = {0};
 bool BLE_connected = false;
 bool BLE_new_notify = false;
 
-static BLEUUID ATC_BLE_OEPL_ServiceUUID((uint16_t)0x1337);
-static BLEUUID ATC_BLE_OEPL_CtrlUUID((uint16_t)0x1337);
+static NimBLEUUID ATC_BLE_OEPL_ServiceUUID((uint16_t)0x1337);
+static NimBLEUUID ATC_BLE_OEPL_CtrlUUID((uint16_t)0x1337);
 
-static BLEUUID gicServiceUUID((uint16_t)0xfef0);
-static BLEUUID gicCtrlUUID((uint16_t)0xfef1);
-static BLEUUID gicImgUUID((uint16_t)0xfef2);
+static NimBLEUUID gicServiceUUID((uint16_t)0xfef0);
+static NimBLEUUID gicCtrlUUID((uint16_t)0xfef1);
+static NimBLEUUID gicImgUUID((uint16_t)0xfef2);
 
 // Wolink/Zhsunyco BLE ESL service and characteristic UUIDs.
 // Source: NickWaterton/Wolink wolink_ble.py.
-static BLEUUID wolinkServiceUUID("30323032-4c53-4545-4c42-4b4e494c4f57");
-static BLEUUID wolinkDataUUID("31323032-4c53-4545-4c42-4b4e494c4f57");
-static BLEUUID wolinkAuthUUID("33323032-4c53-4545-4c42-4b4e494c4f57");
-static BLEUUID wolinkStatusUUID("34323032-4c53-4545-4c42-4b4e494c4f57");
+static NimBLEUUID wolinkServiceUUID("30323032-4c53-4545-4c42-4b4e494c4f57");
+static NimBLEUUID wolinkDataUUID("31323032-4c53-4545-4c42-4b4e494c4f57");
+static NimBLEUUID wolinkAuthUUID("33323032-4c53-4545-4c42-4b4e494c4f57");
+static NimBLEUUID wolinkStatusUUID("34323032-4c53-4545-4c42-4b4e494c4f57");
 
 static const uint8_t WOLINK_AES_KEY[16] = {
     0x9B, 0x60, 0x9F, 0x28, 0xBC, 0x49, 0xE2, 0x57,
     0x29, 0xBD, 0x7B, 0x8D, 0xF2, 0x2B, 0x44, 0x20};
 
-BLERemoteCharacteristic* ctrlChar;
-BLERemoteCharacteristic* imgChar;
-BLEAdvertisedDevice* myDevice;
-BLEClient* pClient;
+NimBLERemoteCharacteristic* ctrlChar = nullptr;
+NimBLERemoteCharacteristic* imgChar = nullptr;
+NimBLEClient* pClient = nullptr;
 
 uint8_t BLE_notify_buffer[256] = {0};
 
@@ -94,10 +93,11 @@ static void BLE_freeImageBuffer() {
 }
 
 static void notifyCallback(
-    BLERemoteCharacteristic* pBLERemoteCharacteristic,
+    NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
     uint8_t* pData,
     size_t length,
     bool isNotify) {
+    if (length > sizeof(BLE_notify_buffer) - 1) length = sizeof(BLE_notify_buffer) - 1;  // [0] holds the length
     Serial.print("Notify callback for characteristic ");
     Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
     Serial.print(" of data length ");
@@ -112,111 +112,86 @@ static void notifyCallback(
     BLE_new_notify = true;
 }
 
-class MyClientCallback : public BLEClientCallbacks {
-    void onConnect(BLEClient* pclient) {
+class MyClientCallback : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pclient) override {
         Serial.println("BLE onConnect");
         BLE_connected = true;
     }
 
-    void onDisconnect(BLEClient* pclient) {
-        Serial.println("BLE onDisconnect");
-        pclient->disconnect();
+    void onDisconnect(NimBLEClient* pclient, int reason) override {
+        Serial.printf("BLE onDisconnect, reason %d\r\n", reason);
         BLE_connected = false;
         ble_main_state = BLE_MAIN_STATE_IDLE;
     }
 };
 
-// One instance for all connections; this used to be `new`-ed for every connection and never freed.
+// One instance for all connections; the Bluedroid version `new`-ed one per connection and never freed it.
 static MyClientCallback bleClientCallbacks;
 
-// Arduino-ESP32 2.x never frees a BLEClient: BLEDevice::createClient() is a plain `new`, and each client keeps its
-// FreeRTOS semaphores (internal RAM) plus every service, characteristic and descriptor it discovered, roughly 1-2.5 KB
-// of internal RAM per connection. Uploads still get a fresh client each time, but old clients are now freed once the
-// BT stack can no longer reach them. Library quirks that shape this:
-//  - a client is unreachable only once it is disconnected and its disconnect handler (or a failed connect()) has taken
-//    it out of BLEDevice's peer list. That handler keeps running briefly after it marks the client disconnected, so a
-//    retired client is freed one acquire later, i.e. an upload cycle (seconds) afterwards;
-//  - BLEDevice keeps a private pointer to the newest client and calls into it on every GAP event, so only clients
-//    older than the newest one are ever freed;
-//  - BLERemoteCharacteristic::removeDescriptors() erases map entries while iterating the same map (undefined
-//    behaviour) and runs for every characteristic when a client is deleted. Descriptors are deleted here first, for
-//    the services fetched through BLE_getService(); no other service has fetched characteristics.
-#define BLE_MAX_TRACKED_SERVICES 4
-struct TrackedClient {
-    BLEClient* client = nullptr;
-    BLERemoteService* services[BLE_MAX_TRACKED_SERVICES] = {};
-    uint8_t serviceCount = 0;
-    bool overflow = false;  // more services than we can sanitize: never free this client
+// Tags are addressed by their tagDB MAC, which has no room for the BLE address type. NimBLE needs that type to
+// connect (a random static address dialled as public never answers), so the scan filter records it here for every
+// supported device. Unknown addresses fall back to public, which is what the Bluedroid code always used.
+#define BLE_ADDRESS_TYPE_SLOTS 32
+struct AddressTypeSlot {
+    uint8_t mac[6];
+    uint8_t type;
+    bool used;
 };
-static TrackedClient currentClient;  // handed out by the last BLE_acquireClient()
-static TrackedClient retiredClient;  // torn down; freed by the next BLE_acquireClient()
+static AddressTypeSlot addressTypeSlots[BLE_ADDRESS_TYPE_SLOTS];
+static uint8_t addressTypeNextSlot = 0;
+static portMUX_TYPE addressTypeLock = portMUX_INITIALIZER_UNLOCKED;  // scan callback (host task) vs BLETask
 
-BLERemoteService* BLE_getService(BLEClient* client, BLEUUID uuid) {
-    BLERemoteService* svc = client->getService(uuid);
-    if (svc != nullptr && client == currentClient.client) {
-        bool known = false;
-        for (uint8_t i = 0; i < currentClient.serviceCount; i++) known |= (currentClient.services[i] == svc);
-        if (!known) {
-            if (currentClient.serviceCount < BLE_MAX_TRACKED_SERVICES) {
-                currentClient.services[currentClient.serviceCount++] = svc;
-            } else {
-                currentClient.overflow = true;
-            }
+void BLE_rememberAddressType(const uint8_t mac[8], uint8_t addressType) {
+    portENTER_CRITICAL(&addressTypeLock);
+    int slot = -1;
+    for (int i = 0; i < BLE_ADDRESS_TYPE_SLOTS; i++) {
+        if (addressTypeSlots[i].used && memcmp(addressTypeSlots[i].mac, mac, 6) == 0) {
+            slot = i;
+            break;
         }
     }
-    return svc;
+    if (slot < 0) {  // new device: take the oldest slot
+        slot = addressTypeNextSlot;
+        addressTypeNextSlot = (addressTypeNextSlot + 1) % BLE_ADDRESS_TYPE_SLOTS;
+        memcpy(addressTypeSlots[slot].mac, mac, 6);
+        addressTypeSlots[slot].used = true;
+    }
+    addressTypeSlots[slot].type = addressType;
+    portEXIT_CRITICAL(&addressTypeLock);
 }
 
-static void BLE_freeClient(TrackedClient& t) {
-    for (uint8_t i = 0; i < t.serviceCount; i++) {
-        for (auto& ch : *t.services[i]->getCharacteristicsByHandle()) {
-            std::map<std::string, BLERemoteDescriptor*>* descriptors = ch.second->getDescriptors();
-            for (auto& d : *descriptors) delete d.second;
-            descriptors->clear();
+NimBLEAddress BLE_tagAddress(const uint8_t mac[8]) {
+    uint8_t type = BLE_ADDR_PUBLIC;
+    portENTER_CRITICAL(&addressTypeLock);
+    for (int i = 0; i < BLE_ADDRESS_TYPE_SLOTS; i++) {
+        if (addressTypeSlots[i].used && memcmp(addressTypeSlots[i].mac, mac, 6) == 0) {
+            type = addressTypeSlots[i].type;
+            break;
         }
     }
-    delete t.client;
-    t = TrackedClient();
+    portEXIT_CRITICAL(&addressTypeLock);
+    const uint8_t msbFirst[6] = {mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]};
+    return NimBLEAddress(msbFirst, type);
 }
 
-// Never torn down: no disconnect event arrived, or a failed open left its GATT app registered. The BT stack may still
-// deliver events to it, so it is leaked rather than freed. It is taken out of the peer list first: otherwise it would
-// also receive the events of the next client (which can get the same GATT interface), and its late disconnect handler
-// would unregister that client's app in the middle of connect(). Then its GATT app slot is released.
-static void BLE_abandonClient(BLEClient* client) {
-    Serial.println("BLE: previous client was not torn down cleanly, not freeing it");
-    client->setClientCallbacks(nullptr);
-    BLEDevice::removePeerDevice(client->m_appId, true);
-    if (client->getGattcIf() != ESP_GATT_IF_NONE) esp_ble_gattc_app_unregister(client->getGattcIf());
-    BLE_connected = false;  // its disconnect callback will not run any more
-}
-
-BLEClient* BLE_acquireClient(BLEClientCallbacks* callbacks) {
-    if (retiredClient.client != nullptr) BLE_freeClient(retiredClient);
-
-    TrackedClient previous = currentClient;
-    currentClient = TrackedClient();
-    if (previous.client != nullptr) {
-        BLEClient* old = previous.client;
-        if (old->isConnected()) old->disconnect();
+NimBLEClient* BLE_getClient(NimBLEClientCallbacks* callbacks) {
+    static NimBLEClient* client = nullptr;
+    if (client == nullptr) client = NimBLEDevice::createClient();
+    if (client->isConnected()) {
+        client->disconnect();
         const uint32_t t0 = millis();
-        while ((old->isConnected() || old->getGattcIf() != ESP_GATT_IF_NONE) && millis() - t0 < 3000) {
-            vTaskDelay(20 / portTICK_PERIOD_MS);
-        }
-        if (old->isConnected() || old->getGattcIf() != ESP_GATT_IF_NONE) {
-            BLE_abandonClient(old);
-        } else if (!previous.overflow) {
-            retiredClient = previous;
-        }  // else: torn down, but its descriptors can't all be cleaned up; leaking it is harmless
+        while (client->isConnected() && millis() - t0 < 3000) vTaskDelay(20 / portTICK_PERIOD_MS);
     }
+    client->setClientCallbacks(callbacks, false);  // our callback objects are static: the client must not delete them
+    return client;
+}
 
-    // BLEClient::connect() takes a new GATT app id every time and esp_ble_gattc_app_register() rejects ids above
-    // 0x7FFF, so without restarts BLE would stop working after ~32k connections. None of our apps is registered now.
-    if (BLEDevice::m_appId >= 0x7F00) BLEDevice::m_appId = 0;
-
-    currentClient.client = BLEDevice::createClient();
-    currentClient.client->setClientCallbacks(callbacks);
-    return currentClient.client;
+uint16_t BLE_waitForMtu(NimBLEClient* client, uint32_t timeoutMs) {
+    const uint32_t t0 = millis();
+    while (client->isConnected() && client->getMTU() <= 23 && millis() - t0 < timeoutMs) {  // 23 = default ATT MTU
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+    return client->getMTU();
 }
 
 enum BLE_CONNECTION_TYPE {
@@ -226,12 +201,10 @@ enum BLE_CONNECTION_TYPE {
 
 bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
     BLE_err_counter = 0;
-    uint8_t temp_Address[] = {addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]};
     Serial.printf("BLE Connecting to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
-    pClient = BLE_acquireClient(&bleClientCallbacks);
-    if (!pClient->connect(BLEAddress(temp_Address))) {
+    pClient = BLE_getClient(&bleClientCallbacks);
+    if (!pClient->connect(BLE_tagAddress(addr), true)) {
         Serial.printf("BLE connection failed\r\n");
-        pClient->disconnect();
         return false;
     }
     uint32_t timeStart = millis();
@@ -241,7 +214,7 @@ bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
     if (!BLE_connected)
         return false;
     Serial.printf("BLE starting to get service\r\n");
-    BLERemoteService* pRemoteService = BLE_getService(pClient, (conn_type == BLE_TYPE_GICISKY) ? gicServiceUUID : ATC_BLE_OEPL_ServiceUUID);
+    NimBLERemoteService* pRemoteService = pClient->getService((conn_type == BLE_TYPE_GICISKY) ? gicServiceUUID : ATC_BLE_OEPL_ServiceUUID);
     if (pRemoteService == nullptr) {
         Serial.printf("BLE Service failed\r\n");
         pClient->disconnect();
@@ -261,38 +234,34 @@ bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
         pClient->disconnect();
         return false;
     }
-    if (ctrlChar->canNotify()) {
-        ctrlChar->registerForNotify(notifyCallback);
-    } else {
+    if (!ctrlChar->canNotify() || !ctrlChar->subscribe(true, notifyCallback)) {
         Serial.printf("BLE Notify failed\r\n");
         pClient->disconnect();
         return false;
     }
-    if (pClient->setMTU(255) == false) {
-        Serial.printf("BLE MTU failed\r\n");
-        pClient->disconnect();
-        return false;
-    }
+    // Part writes are up to 244 bytes: make sure the MTU exchange NimBLE started on connect has finished.
+    Serial.printf("BLE MTU %u\r\n", BLE_waitForMtu(pClient, 3000));
     Serial.printf("BLE Connected fully to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
     return true;
 }
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
+class MyScanCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
         BLE_filter_add_device(advertisedDevice);
     }
 };
 
-// One instance for all scans; this used to be `new`-ed (and leaked) on every scan, i.e. once a minute.
-static MyAdvertisedDeviceCallbacks bleScanCallbacks;
+// One instance for all scans; the Bluedroid version `new`-ed (and leaked) one on every scan, i.e. once a minute.
+static MyScanCallbacks bleScanCallbacks;
 
 void BLE_startScan(uint32_t timeout) {
-    BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(&bleScanCallbacks);
+    NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setScanCallbacks(&bleScanCallbacks, false);  // controller drops duplicates: one report per device and scan
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
-    pBLEScan->start(timeout, false);
+    pBLEScan->setMaxResults(0);                   // everything goes through the callback, nothing is kept
+    pBLEScan->getResults(timeout * 1000, false);  // blocks this task for the duration of the scan
 }
 
 #define BLOCK_DATA_SIZE_BLE 4096
@@ -345,7 +314,7 @@ volatile bool wolink_status_received = false;
 volatile uint8_t wolink_status[2] = {0xFF, 0xFF};
 
 static void wolinkStatusNotifyCallback(
-    BLERemoteCharacteristic* pBLERemoteCharacteristic,
+    NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
     uint8_t* pData,
     size_t length,
     bool isNotify) {
@@ -382,14 +351,12 @@ static void wolink_aes_encrypt_challenge(const uint8_t challenge[16], uint8_t ou
 // Run a complete Wolink image upload: connect, authenticate, send pixels,
 // trigger refresh, wait for the EPD to report idle. Returns true on success.
 static bool wolink_upload(uint8_t address[8]) {
-    uint8_t temp_Address[] = {address[5], address[4], address[3], address[2], address[1], address[0]};
     Serial.printf("Wolink connecting to %02X:%02X:%02X:%02X:%02X:%02X\r\n",
                   address[5], address[4], address[3], address[2], address[1], address[0]);
 
-    pClient = BLE_acquireClient(&bleClientCallbacks);
-    if (!pClient->connect(BLEAddress(temp_Address))) {
+    pClient = BLE_getClient(&bleClientCallbacks);
+    if (!pClient->connect(BLE_tagAddress(address), true)) {
         Serial.println("Wolink connect failed");
-        pClient->disconnect();
         return false;
     }
 
@@ -400,19 +367,21 @@ static bool wolink_upload(uint8_t address[8]) {
         pClient->disconnect();
         return false;
     }
-    if (!pClient->setMTU(247)) {
-        Serial.println("Wolink MTU negotiation failed (continuing)");
+    // The chunk size below assumes MTU 247; NimBLE negotiates up to 255 on connect.
+    const uint16_t mtu = BLE_waitForMtu(pClient, 3000);
+    if (mtu < 247) {
+        Serial.printf("Wolink MTU %u is below 247 (continuing)\r\n", mtu);
     }
 
-    BLERemoteService* svc = BLE_getService(pClient, wolinkServiceUUID);
+    NimBLERemoteService* svc = pClient->getService(wolinkServiceUUID);
     if (!svc) {
         Serial.println("Wolink service not found");
         pClient->disconnect();
         return false;
     }
-    BLERemoteCharacteristic* dataChar = svc->getCharacteristic(wolinkDataUUID);
-    BLERemoteCharacteristic* authChar = svc->getCharacteristic(wolinkAuthUUID);
-    BLERemoteCharacteristic* statusChar = svc->getCharacteristic(wolinkStatusUUID);
+    NimBLERemoteCharacteristic* dataChar = svc->getCharacteristic(wolinkDataUUID);
+    NimBLERemoteCharacteristic* authChar = svc->getCharacteristic(wolinkAuthUUID);
+    NimBLERemoteCharacteristic* statusChar = svc->getCharacteristic(wolinkStatusUUID);
     if (!dataChar || !authChar || !statusChar) {
         Serial.println("Wolink characteristic discovery failed");
         pClient->disconnect();
@@ -422,22 +391,24 @@ static bool wolink_upload(uint8_t address[8]) {
         wolink_status_received = false;
         wolink_status[0] = 0xFF;
         wolink_status[1] = 0xFF;
-        statusChar->registerForNotify(wolinkStatusNotifyCallback);
+        if (!statusChar->subscribe(true, wolinkStatusNotifyCallback)) {
+            Serial.println("Wolink status notify subscription failed (continuing)");
+        }
     } else {
         Serial.println("Wolink status char does not notify");
     }
 
     // 1) Authenticate: read 16-byte challenge, write AES-CBC response.
-    std::string challenge = authChar->readValue();
+    NimBLEAttValue challenge = authChar->readValue();
     if (challenge.size() < 16) {
         Serial.printf("Wolink auth challenge too short (%u)\r\n", (unsigned)challenge.size());
         pClient->disconnect();
         return false;
     }
     uint8_t resp[16];
-    wolink_aes_encrypt_challenge((const uint8_t*)challenge.data(), resp);
+    wolink_aes_encrypt_challenge(challenge.data(), resp);
     Serial.printf("Wolink auth challenge=");
-    for (int i = 0; i < 16; i++) Serial.printf("%02X", (uint8_t)challenge[i]);
+    for (int i = 0; i < 16; i++) Serial.printf("%02X", challenge.data()[i]);
     Serial.printf(" resp=");
     for (int i = 0; i < 16; i++) Serial.printf("%02X", resp[i]);
     Serial.println();
@@ -471,7 +442,13 @@ static bool wolink_upload(uint8_t address[8]) {
         pkt[4] = (off >> 16) & 0xFF;
         pkt[5] = (off >> 24) & 0xFF;
         memcpy(pkt + 6, BLE_image_buffer + off, this_n);
-        dataChar->writeValue(pkt, 6 + this_n, true);
+        if (!dataChar->writeValue(pkt, 6 + this_n, true) && !pClient->isConnected()) {
+            // NimBLE fails writes on a dropped link right away (Bluedroid could hang instead). Without this check
+            // the remaining chunks would "send" instantly and the disconnect below would pass for success.
+            Serial.printf("Wolink: link lost at offset %u\r\n", (unsigned)off);
+            BLE_freeImageBuffer();
+            return false;
+        }
         supervisorHeartbeat(SUPERVISED_BLE);  // a 7.5" image is ~400 chunks
         delay(15);
     }
@@ -523,11 +500,12 @@ static bool wolink_upload(uint8_t address[8]) {
 void BLETask(void* parameter) {
     vTaskDelay(5000 / portTICK_PERIOD_MS);
     Serial.println("BLE task started");
-    BLEDevice::init("");
+    NimBLEDevice::init("");
+    NimBLEDevice::setMTU(255);  // preferred ATT MTU, exchanged on every connect
     while (1) {
-        // The Arduino BLE library waits forever for GATT events (connect, discovery, reads, writes with response,
-        // scan end). If one never arrives, e.g. because the peer dropped the link mid-operation, this task hangs for
-        // good; the supervisor notices the missing heartbeat and restarts the AP.
+        // NimBLE completes every GATT operation: the host fails pending ones when a link drops and times out
+        // unanswered ones after 30 s (the Bluedroid library could wait forever here). The heartbeat stays as a
+        // backstop: if this task still stops, the supervisor restarts the AP.
         supervisorHeartbeat(SUPERVISED_BLE);
         switch (ble_main_state) {
             default:
@@ -673,7 +651,7 @@ void BLETask(void* parameter) {
                         default:
                         case BLE_UPLOAD_STATE_INIT:
                             BLE_mini_buff[0] = 1;
-                            ctrlChar->writeValue(BLE_mini_buff, 1);
+                            ctrlChar->writeValue(BLE_mini_buff, 1, false);
                             break;
                         case BLE_UPLOAD_STATE_SIZE:
                             BLE_mini_buff[0] = 0x02;
@@ -682,11 +660,11 @@ void BLETask(void* parameter) {
                             BLE_mini_buff[3] = (BLE_compressed_len >> 16) & 0xff;
                             BLE_mini_buff[4] = (BLE_compressed_len >> 24) & 0xff;
                             BLE_mini_buff[5] = 0x00;
-                            ctrlChar->writeValue(BLE_mini_buff, 6);
+                            ctrlChar->writeValue(BLE_mini_buff, 6, false);
                             break;
                         case BLE_UPLOAD_STATE_START:
                             BLE_mini_buff[0] = 0x03;
-                            ctrlChar->writeValue(BLE_mini_buff, 1);
+                            ctrlChar->writeValue(BLE_mini_buff, 1, false);
                             break;
                         case BLE_UPLOAD_STATE_UPLOAD:
                             if (BLE_notify_buffer[2] == 0x08) {
@@ -720,7 +698,7 @@ void BLETask(void* parameter) {
                                 BLE_mini_buff[2] = (BLE_curr_part >> 16) & 0xff;
                                 BLE_mini_buff[3] = (BLE_curr_part >> 24) & 0xff;
                                 memcpy((uint8_t*)&BLE_mini_buff[4], (uint8_t*)&BLE_image_buffer[BLE_curr_part * 240], curr_len);
-                                imgChar->writeValue(BLE_mini_buff, curr_len + 4);
+                                imgChar->writeValue(BLE_mini_buff, curr_len + 4, false);
                                 Serial.printf("BLE sending part: %i\r\n", BLE_curr_part);
                                 BLE_curr_part++;
                             }
@@ -748,7 +726,7 @@ void BLETask(void* parameter) {
                             BLE_mini_buff[0] = 0x00;
                             BLE_mini_buff[1] = 0x64;
                             memcpy((uint8_t*)&BLE_mini_buff[2], &BLEavaildatainfo, sizeof(struct AvailDataInfo));
-                            ctrlChar->writeValue(BLE_mini_buff, sizeof(struct AvailDataInfo) + 2);
+                            ctrlChar->writeValue(BLE_mini_buff, sizeof(struct AvailDataInfo) + 2, false);
                             BLE_upload_state = BLE_UPLOAD_STATE_UPLOAD;
                             break;
                         case BLE_UPLOAD_STATE_UPLOAD: {

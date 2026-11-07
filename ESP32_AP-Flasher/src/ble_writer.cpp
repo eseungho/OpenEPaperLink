@@ -131,7 +131,7 @@ static MyClientCallback bleClientCallbacks;
 // Tags are addressed by their tagDB MAC, which has no room for the BLE address type. NimBLE needs that type to
 // connect (a random static address dialled as public never answers), so the scan filter records it here for every
 // supported device. Unknown addresses fall back to public, which is what the Bluedroid code always used.
-#define BLE_ADDRESS_TYPE_SLOTS 32
+#define BLE_ADDRESS_TYPE_SLOTS 64
 struct AddressTypeSlot {
     uint8_t mac[6];
     uint8_t type;
@@ -139,10 +139,9 @@ struct AddressTypeSlot {
 };
 static AddressTypeSlot addressTypeSlots[BLE_ADDRESS_TYPE_SLOTS];
 static uint8_t addressTypeNextSlot = 0;
-static portMUX_TYPE addressTypeLock = portMUX_INITIALIZER_UNLOCKED;  // scan callback (host task) vs BLETask
 
 void BLE_rememberAddressType(const uint8_t mac[8], uint8_t addressType) {
-    portENTER_CRITICAL(&addressTypeLock);
+    // Only BLETask touches this table (scan results are parsed there).
     int slot = -1;
     for (int i = 0; i < BLE_ADDRESS_TYPE_SLOTS; i++) {
         if (addressTypeSlots[i].used && memcmp(addressTypeSlots[i].mac, mac, 6) == 0) {
@@ -157,19 +156,16 @@ void BLE_rememberAddressType(const uint8_t mac[8], uint8_t addressType) {
         addressTypeSlots[slot].used = true;
     }
     addressTypeSlots[slot].type = addressType;
-    portEXIT_CRITICAL(&addressTypeLock);
 }
 
 NimBLEAddress BLE_tagAddress(const uint8_t mac[8]) {
     uint8_t type = BLE_ADDR_PUBLIC;
-    portENTER_CRITICAL(&addressTypeLock);
     for (int i = 0; i < BLE_ADDRESS_TYPE_SLOTS; i++) {
         if (addressTypeSlots[i].used && memcmp(addressTypeSlots[i].mac, mac, 6) == 0) {
             type = addressTypeSlots[i].type;
             break;
         }
     }
-    portEXIT_CRITICAL(&addressTypeLock);
     const uint8_t msbFirst[6] = {mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]};
     return NimBLEAddress(msbFirst, type);
 }
@@ -177,10 +173,20 @@ NimBLEAddress BLE_tagAddress(const uint8_t mac[8]) {
 NimBLEClient* BLE_getClient(NimBLEClientCallbacks* callbacks) {
     static NimBLEClient* client = nullptr;
     if (client == nullptr) client = NimBLEDevice::createClient();
-    if (client->isConnected()) {
+    if (client == nullptr) return nullptr;
+    // isConnected() turns false as soon as disconnect() is called, but connect() refuses to start until the
+    // disconnect event has released the connection handle.
+    if (client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE) {
         client->disconnect();
         const uint32_t t0 = millis();
-        while (client->isConnected() && millis() - t0 < 3000) vTaskDelay(20 / portTICK_PERIOD_MS);
+        while (client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE && millis() - t0 < 5000) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+        }
+        if (client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE) {
+            Serial.println("BLE: previous connection did not close, skipping");
+            return nullptr;
+        }
+        vTaskDelay(20 / portTICK_PERIOD_MS);  // the host task marks the client disconnected right after the handle
     }
     client->setClientCallbacks(callbacks, false);  // our callback objects are static: the client must not delete them
     return client;
@@ -201,9 +207,11 @@ enum BLE_CONNECTION_TYPE {
 
 bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
     BLE_err_counter = 0;
+    ctrlChar = nullptr;  // they belong to the previous connection's attribute tree, which connect() deletes
+    imgChar = nullptr;
     Serial.printf("BLE Connecting to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
     pClient = BLE_getClient(&bleClientCallbacks);
-    if (!pClient->connect(BLE_tagAddress(addr), true)) {
+    if (pClient == nullptr || !pClient->connect(BLE_tagAddress(addr), true)) {
         Serial.printf("BLE connection failed\r\n");
         return false;
     }
@@ -234,20 +242,67 @@ bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
         pClient->disconnect();
         return false;
     }
-    if (!ctrlChar->canNotify() || !ctrlChar->subscribe(true, notifyCallback)) {
+    if (!ctrlChar->canNotify()) {
         Serial.printf("BLE Notify failed\r\n");
         pClient->disconnect();
         return false;
     }
-    // Part writes are up to 244 bytes: make sure the MTU exchange NimBLE started on connect has finished.
-    Serial.printf("BLE MTU %u\r\n", BLE_waitForMtu(pClient, 3000));
-    Serial.printf("BLE Connected fully to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    if (!ctrlChar->subscribe(true, notifyCallback)) {
+        // registerForNotify() ignored a failed CCCD write too; notifications may still arrive.
+        Serial.printf("BLE notify subscription failed (continuing)\r\n");
+    }
+    // Gicisky parts are 4 + 240 bytes, ATC block parts 2 + 3 + 230 bytes, plus 3 bytes ATT header. Below that NimBLE
+    // would turn them into long writes, which it silently truncates if the tag rejects them.
+    const uint16_t mtuNeeded = (conn_type == BLE_TYPE_GICISKY) ? (4 + 240 + 3) : (2 + 3 + 230 + 3);
+    const uint16_t mtu = BLE_waitForMtu(pClient, 3000);
+    if (mtu < mtuNeeded) {
+        Serial.printf("BLE MTU %u too small (need %u)\r\n", mtu, mtuNeeded);
+        pClient->disconnect();
+        return false;
+    }
+    Serial.printf("BLE Connected fully to: %02X:%02X:%02X:%02X:%02X:%02X, MTU %u\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0], mtu);
     return true;
 }
 
+// Scan reports are only copied here by the NimBLE host task and parsed by BLETask once the scan is over. The host
+// task also has to drain the controller's 8 advertising-report buffers; parsing in it (processDataReq, serial logging
+// at 115200 baud) made it drop reports.
+#define BLE_SCAN_RECORDS_MAX 128
+static BLE_ScanRecord* scanRecords = nullptr;  // allocated once (PSRAM when available)
+static uint16_t scanRecordCount = 0;
+static bool scanRecordsOverflow = false;
+static SemaphoreHandle_t scanRecordsMutex = nullptr;
+
 class MyScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-        BLE_filter_add_device(advertisedDevice);
+        if (scanRecords == nullptr || scanRecordsMutex == nullptr || xSemaphoreTake(scanRecordsMutex, pdMS_TO_TICKS(5)) != pdTRUE) return;
+        const uint8_t* addr = advertisedDevice->getAddress().getVal();
+        const std::vector<uint8_t>& payload = advertisedDevice->getPayload();
+        const uint8_t len = payload.size() < sizeof(BLE_ScanRecord::payload) ? payload.size() : sizeof(BLE_ScanRecord::payload);
+        BLE_ScanRecord* rec = nullptr;
+        for (uint16_t i = 0; i < scanRecordCount; i++) {
+            if (memcmp(scanRecords[i].addr, addr, 6) == 0) {
+                rec = &scanRecords[i];
+                break;
+            }
+        }
+        if (rec == nullptr) {
+            if (scanRecordCount < BLE_SCAN_RECORDS_MAX) {
+                rec = &scanRecords[scanRecordCount++];
+                memcpy(rec->addr, addr, 6);
+                rec->payloadLen = 0;
+            } else {
+                scanRecordsOverflow = true;
+            }
+        }
+        // Keep the most complete report: advertisement plus scan response beats either part alone.
+        if (rec != nullptr && len >= rec->payloadLen) {
+            rec->addrType = advertisedDevice->getAddress().getType();
+            rec->rssi = advertisedDevice->getRSSI();
+            rec->payloadLen = len;
+            memcpy(rec->payload, payload.data(), len);
+        }
+        xSemaphoreGive(scanRecordsMutex);
     }
 };
 
@@ -255,13 +310,32 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
 static MyScanCallbacks bleScanCallbacks;
 
 void BLE_startScan(uint32_t timeout) {
+    if (scanRecordsMutex == nullptr) scanRecordsMutex = xSemaphoreCreateMutex();
+    if (scanRecords == nullptr) scanRecords = static_cast<BLE_ScanRecord*>(malloc(sizeof(BLE_ScanRecord) * BLE_SCAN_RECORDS_MAX));
+    if (scanRecords == nullptr || scanRecordsMutex == nullptr) return;
+
+    xSemaphoreTake(scanRecordsMutex, portMAX_DELAY);
+    scanRecordCount = 0;
+    scanRecordsOverflow = false;
+    xSemaphoreGive(scanRecordsMutex);
+
     NimBLEScan* pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setScanCallbacks(&bleScanCallbacks, false);  // controller drops duplicates: one report per device and scan
+    // Controller duplicate filter off, as with the Bluedroid library: a report the host had to drop is replaced by the
+    // device's next advertisement. Duplicates are merged in scanRecords instead.
+    pBLEScan->setScanCallbacks(&bleScanCallbacks, true);
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
     pBLEScan->setMaxResults(0);                   // everything goes through the callback, nothing is kept
     pBLEScan->getResults(timeout * 1000, false);  // blocks this task for the duration of the scan
+
+    xSemaphoreTake(scanRecordsMutex, portMAX_DELAY);
+    if (scanRecordsOverflow) Serial.printf("BLE scan: more than %d devices, the rest were ignored\r\n", BLE_SCAN_RECORDS_MAX);
+    for (uint16_t i = 0; i < scanRecordCount; i++) {
+        BLE_filter_add_device(scanRecords[i]);
+        supervisorHeartbeat(SUPERVISED_BLE);
+    }
+    xSemaphoreGive(scanRecordsMutex);
 }
 
 #define BLOCK_DATA_SIZE_BLE 4096
@@ -355,7 +429,7 @@ static bool wolink_upload(uint8_t address[8]) {
                   address[5], address[4], address[3], address[2], address[1], address[0]);
 
     pClient = BLE_getClient(&bleClientCallbacks);
-    if (!pClient->connect(BLE_tagAddress(address), true)) {
+    if (pClient == nullptr || !pClient->connect(BLE_tagAddress(address), true)) {
         Serial.println("Wolink connect failed");
         return false;
     }
@@ -367,10 +441,12 @@ static bool wolink_upload(uint8_t address[8]) {
         pClient->disconnect();
         return false;
     }
-    // The chunk size below assumes MTU 247; NimBLE negotiates up to 255 on connect.
+    // Chunks are sized from the MTU below. Too small an MTU (exchange failed) would make the upload crawl.
     const uint16_t mtu = BLE_waitForMtu(pClient, 3000);
-    if (mtu < 247) {
-        Serial.printf("Wolink MTU %u is below 247 (continuing)\r\n", mtu);
+    if (mtu < 100) {
+        Serial.printf("Wolink MTU %u too small\r\n", mtu);
+        pClient->disconnect();
+        return false;
     }
 
     NimBLERemoteService* svc = pClient->getService(wolinkServiceUUID);
@@ -430,8 +506,9 @@ static bool wolink_upload(uint8_t address[8]) {
     }
     Serial.printf("Wolink packed %u bytes\r\n", (unsigned)BLE_compressed_len);
 
-    // 3) Upload chunks of (mtu-9) bytes with [0x00,0xA5] + offset(LE32) header.
-    const size_t chunk_size = 238;  // matches MTU 247 - 9 byte overhead
+    // 3) Upload chunks of (mtu-9) bytes with [0x00,0xA5] + offset(LE32) header, at most 238 (MTU 247) as before.
+    //    Writes longer than MTU-3 would become long writes, which NimBLE truncates if the tag rejects them.
+    const size_t chunk_size = (mtu - 9) < 238 ? (mtu - 9) : 238;
     uint8_t pkt[6 + 238];
     for (uint32_t off = 0; off < BLE_compressed_len; off += chunk_size) {
         size_t this_n = (BLE_compressed_len - off) < chunk_size ? (BLE_compressed_len - off) : chunk_size;
@@ -513,7 +590,8 @@ void BLETask(void* parameter) {
                 // An upload that ended through the disconnect callback (which only flips the state back to IDLE)
                 // still owns its 135 KB image buffer. Freeing it here plugs that leak; no upload is running in IDLE.
                 BLE_freeImageBuffer();
-                if (millis() - last_ble_scan > (INTERVAL_BLE_SCANNING_SECONDS * 1000)) {
+                // First scan right away: uploads need the address types it records (see BLE_tagAddress()).
+                if (last_ble_scan == 0 || millis() - last_ble_scan > (INTERVAL_BLE_SCANNING_SECONDS * 1000)) {
                     last_ble_scan = millis();
                     Serial.println("Doing the BLE Scan");
                     BLE_startScan(10);  // timeout in seconds, this is blocking but only for this thread!

@@ -131,70 +131,92 @@ static MyClientCallback bleClientCallbacks;
 
 // Arduino-ESP32 2.x never frees a BLEClient: BLEDevice::createClient() is a plain `new`, and each client keeps its
 // FreeRTOS semaphores (internal RAM) plus every service, characteristic and descriptor it discovered, roughly 1-2.5 KB
-// of internal RAM per connection. Uploads still get a fresh client each time, but the previous one is now freed once
-// the BT stack can no longer reach it, i.e. when it is disconnected and its disconnect handler (or failed connect())
-// has removed it from BLEDevice's peer list. Two library quirks shape this:
-//  - BLEDevice keeps a private pointer to the newest client and calls into it on every GAP event, so the replacement
-//    is created before the old client is deleted;
+// of internal RAM per connection. Uploads still get a fresh client each time, but old clients are now freed once the
+// BT stack can no longer reach them. Library quirks that shape this:
+//  - a client is unreachable only once it is disconnected and its disconnect handler (or a failed connect()) has taken
+//    it out of BLEDevice's peer list. That handler keeps running briefly after it marks the client disconnected, so a
+//    retired client is freed one acquire later, i.e. an upload cycle (seconds) afterwards;
+//  - BLEDevice keeps a private pointer to the newest client and calls into it on every GAP event, so only clients
+//    older than the newest one are ever freed;
 //  - BLERemoteCharacteristic::removeDescriptors() erases map entries while iterating the same map (undefined
-//    behaviour), and it runs for every characteristic when a client is deleted. Descriptors are therefore deleted
-//    here first, for the services fetched through BLE_getService(); other services never fetched characteristics.
-static BLEClient* sharedClient = nullptr;
+//    behaviour) and runs for every characteristic when a client is deleted. Descriptors are deleted here first, for
+//    the services fetched through BLE_getService(); no other service has fetched characteristics.
 #define BLE_MAX_TRACKED_SERVICES 4
-static BLERemoteService* trackedServices[BLE_MAX_TRACKED_SERVICES];
-static uint8_t trackedServiceCount = 0;
-static bool trackedServicesOverflow = false;
+struct TrackedClient {
+    BLEClient* client = nullptr;
+    BLERemoteService* services[BLE_MAX_TRACKED_SERVICES] = {};
+    uint8_t serviceCount = 0;
+    bool overflow = false;  // more services than we can sanitize: never free this client
+};
+static TrackedClient currentClient;  // handed out by the last BLE_acquireClient()
+static TrackedClient retiredClient;  // torn down; freed by the next BLE_acquireClient()
 
 BLERemoteService* BLE_getService(BLEClient* client, BLEUUID uuid) {
     BLERemoteService* svc = client->getService(uuid);
-    if (svc != nullptr && client == sharedClient) {
+    if (svc != nullptr && client == currentClient.client) {
         bool known = false;
-        for (uint8_t i = 0; i < trackedServiceCount; i++) known |= (trackedServices[i] == svc);
+        for (uint8_t i = 0; i < currentClient.serviceCount; i++) known |= (currentClient.services[i] == svc);
         if (!known) {
-            if (trackedServiceCount < BLE_MAX_TRACKED_SERVICES) {
-                trackedServices[trackedServiceCount++] = svc;
+            if (currentClient.serviceCount < BLE_MAX_TRACKED_SERVICES) {
+                currentClient.services[currentClient.serviceCount++] = svc;
             } else {
-                trackedServicesOverflow = true;  // can't sanitize them all, so this client won't be freed
+                currentClient.overflow = true;
             }
         }
     }
     return svc;
 }
 
-static void BLE_retireClient(BLEClient* client) {
-    if (client->isConnected()) client->disconnect();
-    const uint32_t t0 = millis();
-    while ((client->isConnected() || client->getGattcIf() != ESP_GATT_IF_NONE) && millis() - t0 < 3000) {
-        vTaskDelay(20 / portTICK_PERIOD_MS);
-    }
-    if (client->isConnected() || client->getGattcIf() != ESP_GATT_IF_NONE || trackedServicesOverflow) {
-        // Not torn down (no disconnect event arrived, or a failed open left its GATT app registered): the BT stack may
-        // still deliver events to it, so leak it rather than risk a use-after-free. Stop it from calling our callbacks
-        // and release its GATT app slot so repeated failures can't exhaust them.
-        Serial.println("BLE: previous client was not torn down cleanly, not freeing it");
-        client->setClientCallbacks(nullptr);
-        if (client->getGattcIf() != ESP_GATT_IF_NONE) esp_ble_gattc_app_unregister(client->getGattcIf());
-    } else {
-        vTaskDelay(100 / portTICK_PERIOD_MS);  // let the BT task finish the disconnect handler that just ran
-        for (uint8_t i = 0; i < trackedServiceCount; i++) {
-            for (auto& ch : *trackedServices[i]->getCharacteristicsByHandle()) {
-                std::map<std::string, BLERemoteDescriptor*>* descriptors = ch.second->getDescriptors();
-                for (auto& d : *descriptors) delete d.second;
-                descriptors->clear();
-            }
+static void BLE_freeClient(TrackedClient& t) {
+    for (uint8_t i = 0; i < t.serviceCount; i++) {
+        for (auto& ch : *t.services[i]->getCharacteristicsByHandle()) {
+            std::map<std::string, BLERemoteDescriptor*>* descriptors = ch.second->getDescriptors();
+            for (auto& d : *descriptors) delete d.second;
+            descriptors->clear();
         }
-        delete client;
     }
-    trackedServiceCount = 0;
-    trackedServicesOverflow = false;
+    delete t.client;
+    t = TrackedClient();
+}
+
+// Never torn down: no disconnect event arrived, or a failed open left its GATT app registered. The BT stack may still
+// deliver events to it, so it is leaked rather than freed. It is taken out of the peer list first: otherwise it would
+// also receive the events of the next client (which can get the same GATT interface), and its late disconnect handler
+// would unregister that client's app in the middle of connect(). Then its GATT app slot is released.
+static void BLE_abandonClient(BLEClient* client) {
+    Serial.println("BLE: previous client was not torn down cleanly, not freeing it");
+    client->setClientCallbacks(nullptr);
+    BLEDevice::removePeerDevice(client->m_appId, true);
+    if (client->getGattcIf() != ESP_GATT_IF_NONE) esp_ble_gattc_app_unregister(client->getGattcIf());
+    BLE_connected = false;  // its disconnect callback will not run any more
 }
 
 BLEClient* BLE_acquireClient(BLEClientCallbacks* callbacks) {
-    BLEClient* previous = sharedClient;
-    sharedClient = BLEDevice::createClient();
-    sharedClient->setClientCallbacks(callbacks);
-    if (previous != nullptr) BLE_retireClient(previous);
-    return sharedClient;
+    if (retiredClient.client != nullptr) BLE_freeClient(retiredClient);
+
+    TrackedClient previous = currentClient;
+    currentClient = TrackedClient();
+    if (previous.client != nullptr) {
+        BLEClient* old = previous.client;
+        if (old->isConnected()) old->disconnect();
+        const uint32_t t0 = millis();
+        while ((old->isConnected() || old->getGattcIf() != ESP_GATT_IF_NONE) && millis() - t0 < 3000) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+        }
+        if (old->isConnected() || old->getGattcIf() != ESP_GATT_IF_NONE) {
+            BLE_abandonClient(old);
+        } else if (!previous.overflow) {
+            retiredClient = previous;
+        }  // else: torn down, but its descriptors can't all be cleaned up; leaking it is harmless
+    }
+
+    // BLEClient::connect() takes a new GATT app id every time and esp_ble_gattc_app_register() rejects ids above
+    // 0x7FFF, so without restarts BLE would stop working after ~32k connections. None of our apps is registered now.
+    if (BLEDevice::m_appId >= 0x7F00) BLEDevice::m_appId = 0;
+
+    currentClient.client = BLEDevice::createClient();
+    currentClient.client->setClientCallbacks(callbacks);
+    return currentClient.client;
 }
 
 enum BLE_CONNECTION_TYPE {

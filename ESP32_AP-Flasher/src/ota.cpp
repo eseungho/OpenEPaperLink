@@ -12,6 +12,7 @@
 #include "leds.h"
 #include "serialap.h"
 #include "storage.h"
+#include "supervisor.h"
 #include "tag_db.h"
 #include "util.h"
 #include "web.h"
@@ -226,6 +227,7 @@ void firmwareUpdateTask(void* parameter) {
 void updateFirmware(const char* url, const char* expectedMd5, const size_t size) {
     util::printHeap();
 
+    supervisorMaintenance(true);
     config.runStatus = RUNSTATUS_STOP;
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     saveDB("/current/tagDB.json");
@@ -283,6 +285,7 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
 
     httpClient.end();
     config.runStatus = RUNSTATUS_RUN;
+    supervisorMaintenance(false);
 }
 
 void handleRollback(AsyncWebServerRequest* request) {
@@ -309,6 +312,7 @@ void C6firmwareUpdateTask(void* parameter) {
     char* urlPtr = reinterpret_cast<char*>(parameter);
 
     LOG("C6firmwareUpdateTask: url '%s'\n", urlPtr);
+    supervisorMaintenance(true);
     wsSerial("Stopping AP service");
 
     gSerialTaskState = SERIAL_STATE_STOP;
@@ -373,6 +377,9 @@ void C6firmwareUpdateTask(void* parameter) {
     // wsSerial("Reboot system now");
     // wsSerial("[reboot]");
     free(urlPtr);
+    // On failure the AP stays FLASHING with runStatus STOP; the supervisor restarts it 30 min from here unless the
+    // user retries the update first.
+    supervisorMaintenance(false);
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
 }

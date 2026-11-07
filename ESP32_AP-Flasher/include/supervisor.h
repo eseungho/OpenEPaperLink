@@ -29,11 +29,15 @@ void supervisorEarlyInit();                  // in setup(), once storage is moun
 void supervisorStart();                      // end of setup(): starts the supervisor task
 void supervisorHeartbeat(SupervisedTask t);  // "still alive", called from the supervised task's main loop
 void supervisorLoopTick();                   // from loop(): heartbeat, and runs a pending graceful reboot
+bool supervisorRebootPending();              // a graceful reboot waits for loop(): long loops should bail out
+void supervisorMaintenance(bool active);     // a firmware update (ESP32 OTA, C6 flash) runs: never reboot under it
 String supervisorBootReport();               // why the supervisor restarted the AP last time ("" if it didn't)
 #else
 inline void supervisorEarlyInit() {}
 inline void supervisorStart() {}
 inline void supervisorHeartbeat(SupervisedTask) {}
 inline void supervisorLoopTick() {}
+inline bool supervisorRebootPending() { return false; }
+inline void supervisorMaintenance(bool) {}
 inline String supervisorBootReport() { return String(); }
 #endif

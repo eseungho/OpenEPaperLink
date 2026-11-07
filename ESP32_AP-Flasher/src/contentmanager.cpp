@@ -61,8 +61,10 @@ void contentRunner() {
     memset(&wifimac[6], 0, 2);
 
     for (tagRecord *taginfo : tagDB) {
-        // One pass can render (and fetch data for) many tags; report progress per tag, not per pass.
+        // One pass can render (and fetch data for) many tags; report progress per tag, not per pass, and let a pending
+        // reboot run its shutdown (DB save) without waiting for the whole pass.
         supervisorHeartbeat(SUPERVISED_LOOP);
+        if (supervisorRebootPending()) break;
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
         if (taginfo->RSSI &&

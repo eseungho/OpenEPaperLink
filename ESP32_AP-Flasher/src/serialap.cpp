@@ -739,16 +739,22 @@ void rxSerialTask2(void* parameter) {
                     vTaskDelay(1000 / portTICK_PERIOD_MS);
                     Serial.println("bringing AP online again");
                     const bool resetOk = bringAPOnline();
+                    // A C6 firmware update may have started meanwhile (bringAPOnline() then fails on purpose): leave
+                    // its FLASHING state and its runStatus alone, or APTask would reset the C6 in the middle of the
+                    // flash.
+                    const bool flashing = apInfo.state == AP_STATE_FLASHING;
                     if (resetOk) {
                         Serial.println("Finished!");
                     } else {
                         // bringAPOnline() leaves the state at OFFLINE, which APTask's recovery loop ignores (it only
                         // retries ONLINE/FAILED). Together with runStatus staying STOP, a single failed reset used to
                         // leave the AP dead until the next reboot. Hand the radio over to that recovery loop instead.
-                        setAPstate(false, AP_STATE_FAILED);
+                        if (!flashing) setAPstate(false, AP_STATE_FAILED);
                         Serial.println("Failed!");
                     }
-                    config.runStatus = prevRunStatus;
+                    // Only undo our own STOP: an OTA or shutdown may have set STOP since, and boot code may already
+                    // have moved INIT on to RUN.
+                    if (!flashing && config.runStatus == RUNSTATUS_STOP) config.runStatus = prevRunStatus;
                     logLine(String("IEEE802.15.4 modem reset ") + (resetOk ? "ok" : "failed"));
                 }
                 rxStrCount = 0;

@@ -7,6 +7,7 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 
 #include "hal/wdt_hal.h"
@@ -38,14 +39,20 @@
 #ifndef SUPERVISOR_AP_STALL_S
 #define SUPERVISOR_AP_STALL_S 300
 #endif
+#ifndef SUPERVISOR_MAX_STALL_REBOOTS
+#define SUPERVISOR_MAX_STALL_REBOOTS 2  // same task stalling right after this many restarts: stop restarting for it
+#endif
 #ifndef SUPERVISOR_MIN_FREE_INTERNAL
 #define SUPERVISOR_MIN_FREE_INTERNAL (16 * 1024)  // Wi-Fi, lwIP and BT buffers come from internal RAM
 #endif
 #ifndef SUPERVISOR_MIN_BLOCK_INTERNAL
 #define SUPERVISOR_MIN_BLOCK_INTERNAL (6 * 1024)
 #endif
-#ifndef SUPERVISOR_MIN_BLOCK_PSRAM
-#define SUPERVISOR_MIN_BLOCK_PSRAM (512 * 1024)  // image buffers for large tags need big contiguous blocks
+#ifndef SUPERVISOR_INSPECT_INTERNAL_BELOW
+#define SUPERVISOR_INSPECT_INTERNAL_BELOW (40 * 1024)  // only then look for fragmentation (see checkMemory())
+#endif
+#ifndef SUPERVISOR_MIN_FREE_PSRAM
+#define SUPERVISOR_MIN_FREE_PSRAM (512 * 1024)  // image buffers for large tags need hundreds of KB
 #endif
 #ifndef SUPERVISOR_LOW_MEM_S
 #define SUPERVISOR_LOW_MEM_S 120  // memory must stay low this long; short dips during TLS or BLE jobs are normal
@@ -71,13 +78,18 @@
 #ifndef SUPERVISOR_HEALTH_LOG_S
 #define SUPERVISOR_HEALTH_LOG_S (6 * 3600)
 #endif
+#ifndef SUPERVISOR_MAINTENANCE_MAX_S
+#define SUPERVISOR_MAINTENANCE_MAX_S (20 * 60)  // a firmware update taking longer than this is stuck itself
+#endif
 #define SUPERVISOR_FIRST_HEALTH_LOG_S 600  // baseline snapshot once things have settled after boot
 #define SUPERVISOR_MIN_UPTIME_FOR_MEM_S 600
 #define SUPERVISOR_MEM_SAMPLE_MS 5000
-#define SUPERVISOR_GRACEFUL_DEADLINE_S 60
+#define SUPERVISOR_STALL_STREAK_CLEAR_S 3600
+#define SUPERVISOR_GRACEFUL_DEADLINE_S 60  // loop() made no progress this long after the request: restart anyway
+#define SUPERVISOR_GRACEFUL_MAX_S 300      // ... or this long, even if loop() is still busy
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Reboot breadcrumb. RTC slow memory survives esp_restart() and panics, so the reason outlives the reboot it causes.
+// RTC memory: survives esp_restart() and panics (not a power cycle), so it can describe the reboot it causes.
 // ---------------------------------------------------------------------------------------------------------------------
 #define BREADCRUMB_MAGIC 0x53555056UL  // "SUPV"
 
@@ -92,7 +104,19 @@ struct Breadcrumb {
     uint32_t check;
 };
 
+// Consecutive stall restarts of the same task, so a stall that comes straight back after every boot (e.g. one tag that
+// always hangs the BLE library) doesn't turn into a restart every few minutes that also takes the healthy parts down.
+#define STALL_MEMO_MAGIC 0x5354414CUL  // "STAL"
+
+struct StallMemo {
+    uint32_t magic;
+    uint32_t task;
+    uint32_t count;
+    uint32_t check;
+};
+
 static RTC_NOINIT_ATTR Breadcrumb s_breadcrumb;
+static RTC_NOINIT_ATTR StallMemo s_stallMemo;
 static String s_bootReport;
 
 static uint32_t breadcrumbCheck(const Breadcrumb& b) {
@@ -103,6 +127,21 @@ static uint32_t breadcrumbCheck(const Breadcrumb& b) {
         h *= 16777619UL;
     }
     return h;
+}
+
+static uint32_t stallMemoCheck(uint32_t task, uint32_t count) {
+    return STALL_MEMO_MAGIC ^ (task * 2654435761UL) ^ (count << 16) ^ 0xA5A5A5A5UL;
+}
+
+static void stallMemoSet(uint32_t task, uint32_t count) {
+    s_stallMemo.magic = STALL_MEMO_MAGIC;
+    s_stallMemo.task = task;
+    s_stallMemo.count = count;
+    s_stallMemo.check = stallMemoCheck(task, count);
+}
+
+static void stallMemoClear() {
+    stallMemoSet(SUPERVISED_COUNT, 0);
 }
 
 static uint32_t uptimeS() {
@@ -141,12 +180,21 @@ static void rwdtFeed() {
     wdt_hal_write_protect_enable(&s_rwdt);
 }
 
+static void rwdtDisarm() {
+    if (!s_rwdtArmed) return;
+    wdt_hal_write_protect_disable(&s_rwdt);
+    wdt_hal_disable(&s_rwdt);
+    wdt_hal_write_protect_enable(&s_rwdt);
+    s_rwdtArmed = false;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Heartbeats. CPU starvation needs no extra check: the SDK's task watchdog already panics (and reboots) when CPU0's
 // idle task starves for 5 s, and anything hogging CPU1 also starves loop(), which is pinned there.
 // ---------------------------------------------------------------------------------------------------------------------
 static volatile uint32_t s_beat[SUPERVISED_COUNT];
 static volatile bool s_beatSeen[SUPERVISED_COUNT];
+static bool s_stallSuppressed[SUPERVISED_COUNT];
 static const uint32_t kStallLimitS[SUPERVISED_COUNT] = {SUPERVISOR_LOOP_STALL_S, SUPERVISOR_BLE_STALL_S,
                                                         SUPERVISOR_AP_STALL_S};
 static const char* const kTaskName[SUPERVISED_COUNT] = {"loop()", "BLE task", "AP task"};
@@ -157,6 +205,14 @@ void supervisorHeartbeat(SupervisedTask t) {
     s_beatSeen[t] = true;
 }
 
+// Firmware updates (ESP32 OTA, C6 flashing) must never be cut short by a restart.
+static volatile bool s_maintenance = false;
+static volatile uint32_t s_maintenanceSince = 0;
+
+void supervisorMaintenance(bool active) {
+    if (active) s_maintenanceSince = millis();
+    s_maintenance = active;
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Reboot requests
@@ -165,6 +221,10 @@ static volatile bool s_rebootPending = false;
 static volatile bool s_rebootGraceful = false;
 static volatile bool s_gracefulStarted = false;
 static uint32_t s_rebootRequestedAt = 0;
+
+bool supervisorRebootPending() {
+    return s_rebootPending;
+}
 
 static void writeBreadcrumb(const String& reason) {
     memset(&s_breadcrumb, 0, sizeof(s_breadcrumb));
@@ -178,14 +238,15 @@ static void writeBreadcrumb(const String& reason) {
     s_breadcrumb.check = breadcrumbCheck(s_breadcrumb);
 }
 
-// graceful: loop() runs the usual shutdown (refresh pending, save the DB) and restarts; if that has not happened within
-// SUPERVISOR_GRACEFUL_DEADLINE_S, the supervisor restarts anyway. Not graceful: restart right away, for cases where
-// loop() itself is the problem (it may hold the filesystem or websocket mutex).
+// graceful: loop() runs the usual shutdown (refresh pending, save the DB) and restarts. Not graceful: restart right
+// away, for when loop() itself is the problem (it may hold the filesystem or websocket mutex).
 static void requestReboot(const String& reason, bool graceful) {
     if (s_rebootPending) return;
+    const bool nightly = reason.startsWith("Nightly");
+    if (nightly) stallMemoClear();  // a planned restart starts a new day: stalls may trigger restarts again
     writeBreadcrumb(reason);
     Serial.println("Supervisor: " + reason + ", rebooting");
-    tryLogLine(reason.startsWith("Nightly") ? reason : "Supervisor: " + reason + ", rebooting", 2000);
+    tryLogLine(nightly ? reason : "Supervisor: " + reason + ", rebooting", 2000);
     s_rebootRequestedAt = millis();
     s_rebootGraceful = graceful;
     s_rebootPending = true;
@@ -225,11 +286,12 @@ static void pingEndCb(esp_ping_handle_t, void*) {
     xSemaphoreGive(s_pingDone);
 }
 
-// Returns false only if the gateway did not answer any of the pings. If the check cannot run, assume all is well.
+// True if the gateway answered at least one of the pings. Failing to even start a ping session (sockets or RAM
+// exhausted) counts as no answer too; the check only arms once a ping has succeeded since boot.
 static bool pingGateway(const IPAddress& gw) {
     if (s_pingDone == nullptr) {
         s_pingDone = xSemaphoreCreateBinary();
-        if (s_pingDone == nullptr) return true;
+        if (s_pingDone == nullptr) return false;
     }
     esp_ping_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -250,7 +312,7 @@ static bool pingGateway(const IPAddress& gw) {
     xSemaphoreTake(s_pingDone, 0);
     s_pingReplies = 0;
     esp_ping_handle_t ping = nullptr;
-    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) return true;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) return false;
     esp_ping_start(ping);
     xSemaphoreTake(s_pingDone, pdMS_TO_TICKS(8000));
     esp_ping_stop(ping);
@@ -285,30 +347,53 @@ struct SupervisorState {
 
 static void checkStalls() {
     for (uint8_t t = 0; t < SUPERVISED_COUNT; t++) {
-        if (!s_beatSeen[t]) continue;  // task not running in this configuration (e.g. BLE disabled)
+        if (!s_beatSeen[t] || s_stallSuppressed[t]) continue;  // not running in this configuration, or given up on
         if (t == SUPERVISED_AP && apInfo.state == AP_STATE_FLASHING) continue;
         const uint32_t beat = s_beat[t];
         const uint32_t age = millis() - beat;  // read the beat first, so this can't underflow
-        if (age > kStallLimitS[t] * 1000UL) {
-            requestReboot(String(kTaskName[t]) + " stalled for " + String(age / 1000) + " s", t != SUPERVISED_LOOP);
-            return;
+        if (age <= kStallLimitS[t] * 1000UL) continue;
+
+        const String what = String(kTaskName[t]) + " stalled for " + String(age / 1000) + " s";
+        const uint32_t repeats = (s_stallMemo.task == t) ? s_stallMemo.count : 0;
+        if (repeats >= SUPERVISOR_MAX_STALL_REBOOTS) {
+            s_stallSuppressed[t] = true;
+            tryLogLine("Supervisor: " + what + " again after " + String(repeats) +
+                           " restarts in a row; not restarting for it until the nightly reboot",
+                       1000);
+            continue;
         }
+        stallMemoSet(t, repeats + 1);
+        requestReboot(what, t != SUPERVISED_LOOP);
+        return;
     }
+}
+
+// Forget the stall streak once the task that stalled has been healthy for a while.
+static void maybeClearStallStreak(uint32_t up) {
+    if (s_stallMemo.count == 0 || up < SUPERVISOR_STALL_STREAK_CLEAR_S) return;
+    const uint32_t t = s_stallMemo.task;
+    if (t >= SUPERVISED_COUNT || !s_beatSeen[t]) {
+        stallMemoClear();
+        return;
+    }
+    const uint32_t beat = s_beat[t];
+    if (!s_stallSuppressed[t] && millis() - beat <= kStallLimitS[t] * 1000UL) stallMemoClear();
 }
 
 static void checkMemory(SupervisorState& s, uint32_t now, uint32_t up) {
     if (now - s.lastMemSample < SUPERVISOR_MEM_SAMPLE_MS) return;
     s.lastMemSample = now;
 
+    // Free sizes are O(1). heap_caps_get_largest_free_block() walks every block of a heap with interrupts disabled,
+    // which for PSRAM (thousands of small blocks, each access a cache miss) can take long enough to drop bytes on the
+    // 2 Mbaud radio UART. So: fragmentation is only examined for internal RAM, and only once it is getting tight.
     const size_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const size_t blockInt = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t blockInt = SIZE_MAX;
+    if (freeInt < SUPERVISOR_INSPECT_INTERNAL_BELOW) blockInt = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     const bool lowInt = freeInt < SUPERVISOR_MIN_FREE_INTERNAL || blockInt < SUPERVISOR_MIN_BLOCK_INTERNAL;
-    size_t blockPs = 0;
-    bool lowPs = false;
-    if (psramFound()) {
-        blockPs = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-        lowPs = blockPs < SUPERVISOR_MIN_BLOCK_PSRAM;
-    }
+    size_t freePs = SIZE_MAX;
+    if (psramFound()) freePs = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const bool lowPs = freePs < SUPERVISOR_MIN_FREE_PSRAM;
 
     if (!lowInt && !lowPs) {
         s.memLow = false;
@@ -317,8 +402,8 @@ static void checkMemory(SupervisorState& s, uint32_t now, uint32_t up) {
     if (!s.memLow) {
         s.memLow = true;
         s.memLowSince = now;
-        Serial.printf("Supervisor: memory low (internal free %u, block %u; psram block %u)\r\n", (unsigned)freeInt,
-                      (unsigned)blockInt, (unsigned)blockPs);
+        Serial.printf("Supervisor: memory low (internal free %u, block %u; psram free %u)\r\n", (unsigned)freeInt,
+                      (unsigned)(blockInt == SIZE_MAX ? 0 : blockInt), (unsigned)(freePs == SIZE_MAX ? 0 : freePs));
         return;
     }
     if (up < SUPERVISOR_MIN_UPTIME_FOR_MEM_S || now - s.memLowSince < SUPERVISOR_LOW_MEM_S * 1000UL) return;
@@ -326,9 +411,9 @@ static void checkMemory(SupervisorState& s, uint32_t now, uint32_t up) {
     char reason[96];
     if (lowInt) {
         snprintf(reason, sizeof(reason), "internal RAM exhausted (free %u, largest block %u)", (unsigned)freeInt,
-                 (unsigned)blockInt);
+                 (unsigned)(blockInt == SIZE_MAX ? 0 : blockInt));
     } else {
-        snprintf(reason, sizeof(reason), "PSRAM exhausted (largest block %u)", (unsigned)blockPs);
+        snprintf(reason, sizeof(reason), "PSRAM exhausted (free %u)", (unsigned)freePs);
     }
     requestReboot(reason, true);
 }
@@ -350,10 +435,13 @@ static void checkNetwork(SupervisorState& s, uint32_t now) {
 
     if (!sta) {
         // Only after having been connected once since boot: if the router is gone for good, rebooting in a loop
-        // doesn't help, and the Wi-Fi manager keeps retrying every 5 minutes anyway. Don't kick a user who is on the
-        // configuration portal either.
-        if (s.netEverUp && WifiManager::apClients == 0 && now - s.netLastUp > SUPERVISOR_NET_DOWN_S * 1000UL) {
-            requestReboot("Wi-Fi down for " + String(SUPERVISOR_NET_DOWN_S / 60) + " min", true);
+        // doesn't help, and the Wi-Fi manager keeps retrying every 5 minutes anyway. A client on the fallback
+        // configuration AP postpones this (someone may be configuring the AP), but not forever: that AP is open,
+        // and a device that auto-joins it would otherwise block recovery for good.
+        const uint32_t down = now - s.netLastUp;
+        const bool portalInUse = WifiManager::apClients != 0 && down < 3UL * SUPERVISOR_NET_DOWN_S * 1000UL;
+        if (s.netEverUp && !portalInUse && down > SUPERVISOR_NET_DOWN_S * 1000UL) {
+            requestReboot("Wi-Fi down for " + String(down / 60000) + " min", true);
         }
         return;
     }
@@ -423,6 +511,7 @@ static void checkNightly(uint32_t up) {
 }
 
 static String healthLine(uint32_t up) {
+    // Walks the heaps (see checkMemory()), but only every few hours.
     char buf[200];
     snprintf(buf, sizeof(buf), "Health: up %s, heap %uk (min %uk, block %uk), psram %uk (block %uk), rssi %d, radio %u, run %u",
              formatUptime(up).c_str(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -435,19 +524,38 @@ static String healthLine(uint32_t up) {
 }
 
 static void supervisorTask(void*) {
+    rwdtArm(SUPERVISOR_RWDT_S);  // from the boot timeout to the runtime one, now that someone feeds it
     SupervisorState s;
     s.netLastUp = millis();
     for (;;) {
         rwdtFeed();
         const uint32_t now = millis();
         const uint32_t up = uptimeS();
+        const bool maintenanceFlag = s_maintenance;  // flag first: supervisorMaintenance() stores the time before it
+        const uint32_t maintenanceSince = s_maintenanceSince;
+        const bool maintenance = maintenanceFlag && millis() - maintenanceSince < SUPERVISOR_MAINTENANCE_MAX_S * 1000UL;
 
         if (s_rebootPending) {
-            if (now - s_rebootRequestedAt > SUPERVISOR_GRACEFUL_DEADLINE_S * 1000UL) {
+            // loop() normally finishes the graceful shutdown within seconds. Restart without it only when loop() has
+            // stopped making progress, or when it is taking far too long.
+            const uint32_t sinceRequest = millis() - s_rebootRequestedAt;
+            const uint32_t loopBeat = s_beat[SUPERVISED_LOOP];
+            const uint32_t loopAge = millis() - loopBeat;
+            if (sinceRequest > SUPERVISOR_GRACEFUL_MAX_S * 1000UL ||
+                (sinceRequest > SUPERVISOR_GRACEFUL_DEADLINE_S * 1000UL && loopAge > SUPERVISOR_GRACEFUL_DEADLINE_S * 1000UL)) {
                 Serial.println("Supervisor: graceful shutdown did not finish, restarting now");
                 esp_restart();
             }
+        } else if (maintenance) {
+            // A firmware update is running: never restart underneath it. Restart the windows of the state checks, so
+            // a condition has to persist for its full time after the update before it counts.
+            s.memLow = false;
+            s.stopped = false;
+            s.radioBad = false;
+            s.netLastUp = now;
+            s.gwLastOk = now;
         } else {
+            maybeClearStallStreak(up);
             checkStalls();
             checkMemory(s, now, up);
             checkNetwork(s, now);
@@ -478,16 +586,20 @@ void supervisorEarlyInit() {
         Serial.println(s_bootReport);
     }
     s_breadcrumb.magic = 0;  // report once
+    if (s_stallMemo.magic != STALL_MEMO_MAGIC || s_stallMemo.check != stallMemoCheck(s_stallMemo.task, s_stallMemo.count)) {
+        stallMemoClear();  // power-on garbage
+    }
     rwdtArm(SUPERVISOR_BOOT_RWDT_S);
 }
 
 void supervisorStart() {
     supervisorHeartbeat(SUPERVISED_LOOP);
-    rwdtArm(SUPERVISOR_RWDT_S);
     // Above the application tasks (loop 1, BLE/AP 5), below the radio UART tasks (11, 15). Not pinned, so it still runs
     // if one core is hogged.
     if (xTaskCreate(supervisorTask, "supervisor", 6144, NULL, 10, NULL) != pdPASS) {
-        Serial.println("Supervisor: could not start task");
+        // Nobody would feed the RTC watchdog, which would turn this into a reset every boot.
+        rwdtDisarm();
+        Serial.println("Supervisor: could not start task, running without it");
     }
 }
 

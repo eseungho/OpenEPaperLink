@@ -13,6 +13,7 @@
 #include "powermgt.h"
 #include "settings.h"
 #include "storage.h"
+#include "supervisor.h"
 #include "web.h"
 #include "zbs_interface.h"
 #include "wifimanager.h"
@@ -731,18 +732,24 @@ void rxSerialTask2(void* parameter) {
                 if (strncmp(rxStr, "receive buffer full, drop the current frame", 43) == 0 && millisDiff(modemResetHoldoff) > 20000) {
                     modemResetHoldoff = millis();
                     vTaskDelay(100 / portTICK_PERIOD_MS);
+                    const uint8_t prevRunStatus = config.runStatus;
                     config.runStatus = RUNSTATUS_STOP;
                     Serial.println("IEEE802.15.4 modem stuck case detected, resetting...");
                     APTagReset();
                     vTaskDelay(1000 / portTICK_PERIOD_MS);
                     Serial.println("bringing AP online again");
-                    if (bringAPOnline()) {
-                        config.runStatus = RUNSTATUS_RUN;
+                    const bool resetOk = bringAPOnline();
+                    if (resetOk) {
                         Serial.println("Finished!");
                     } else {
+                        // bringAPOnline() leaves the state at OFFLINE, which APTask's recovery loop ignores (it only
+                        // retries ONLINE/FAILED). Together with runStatus staying STOP, a single failed reset used to
+                        // leave the AP dead until the next reboot. Hand the radio over to that recovery loop instead.
+                        setAPstate(false, AP_STATE_FAILED);
                         Serial.println("Failed!");
                     }
-                    logLine("IEEE802.15.4 modem reset " + (config.runStatus == RUNSTATUS_RUN) ? ("ok") : ("failed"));
+                    config.runStatus = prevRunStatus;
+                    logLine(String("IEEE802.15.4 modem reset ") + (resetOk ? "ok" : "failed"));
                 }
                 rxStrCount = 0;
                 memset(rxStr, 0, sizeof(rxStr));
@@ -1080,6 +1087,7 @@ void APTask(void* parameter) {
 
     uint8_t attempts = 0;
     while (1) {
+        supervisorHeartbeat(SUPERVISED_AP);
         if (((apInfo.state == AP_STATE_ONLINE) || (apInfo.state == AP_STATE_FAILED)) && (millis() - lastAPActivity > AP_ACTIVITY_MAX_INTERVAL)) {
             bool reply = sendPing();
             if (!reply) {

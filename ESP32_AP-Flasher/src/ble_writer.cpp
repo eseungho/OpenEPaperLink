@@ -5,7 +5,9 @@
 
 #include "BLEDevice.h"
 #include "ble_filter.h"
+#include "ble_writer.h"
 #include "newproto.h"
+#include "supervisor.h"
 #include "tag_db.h"
 #ifdef HAS_NEMONIC_PRINTER
 #include "nemonic_printer.h"
@@ -81,7 +83,15 @@ uint32_t BLE_last_pending_check = 0;
 uint8_t BLE_curr_address[8] = {0};
 
 uint32_t BLE_compressed_len = 0;
-uint8_t* BLE_image_buffer;
+uint8_t* BLE_image_buffer = nullptr;
+
+// Only BLETask allocates and frees this buffer. Always go through here so a pointer is never freed twice.
+static void BLE_freeImageBuffer() {
+    if (BLE_image_buffer != nullptr) {
+        free(BLE_image_buffer);
+        BLE_image_buffer = nullptr;
+    }
+}
 
 static void notifyCallback(
     BLERemoteCharacteristic* pBLERemoteCharacteristic,
@@ -116,6 +126,77 @@ class MyClientCallback : public BLEClientCallbacks {
     }
 };
 
+// One instance for all connections; this used to be `new`-ed for every connection and never freed.
+static MyClientCallback bleClientCallbacks;
+
+// Arduino-ESP32 2.x never frees a BLEClient: BLEDevice::createClient() is a plain `new`, and each client keeps its
+// FreeRTOS semaphores (internal RAM) plus every service, characteristic and descriptor it discovered, roughly 1-2.5 KB
+// of internal RAM per connection. Uploads still get a fresh client each time, but the previous one is now freed once
+// the BT stack can no longer reach it, i.e. when it is disconnected and its disconnect handler (or failed connect())
+// has removed it from BLEDevice's peer list. Two library quirks shape this:
+//  - BLEDevice keeps a private pointer to the newest client and calls into it on every GAP event, so the replacement
+//    is created before the old client is deleted;
+//  - BLERemoteCharacteristic::removeDescriptors() erases map entries while iterating the same map (undefined
+//    behaviour), and it runs for every characteristic when a client is deleted. Descriptors are therefore deleted
+//    here first, for the services fetched through BLE_getService(); other services never fetched characteristics.
+static BLEClient* sharedClient = nullptr;
+#define BLE_MAX_TRACKED_SERVICES 4
+static BLERemoteService* trackedServices[BLE_MAX_TRACKED_SERVICES];
+static uint8_t trackedServiceCount = 0;
+static bool trackedServicesOverflow = false;
+
+BLERemoteService* BLE_getService(BLEClient* client, BLEUUID uuid) {
+    BLERemoteService* svc = client->getService(uuid);
+    if (svc != nullptr && client == sharedClient) {
+        bool known = false;
+        for (uint8_t i = 0; i < trackedServiceCount; i++) known |= (trackedServices[i] == svc);
+        if (!known) {
+            if (trackedServiceCount < BLE_MAX_TRACKED_SERVICES) {
+                trackedServices[trackedServiceCount++] = svc;
+            } else {
+                trackedServicesOverflow = true;  // can't sanitize them all, so this client won't be freed
+            }
+        }
+    }
+    return svc;
+}
+
+static void BLE_retireClient(BLEClient* client) {
+    if (client->isConnected()) client->disconnect();
+    const uint32_t t0 = millis();
+    while ((client->isConnected() || client->getGattcIf() != ESP_GATT_IF_NONE) && millis() - t0 < 3000) {
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+    if (client->isConnected() || client->getGattcIf() != ESP_GATT_IF_NONE || trackedServicesOverflow) {
+        // Not torn down (no disconnect event arrived, or a failed open left its GATT app registered): the BT stack may
+        // still deliver events to it, so leak it rather than risk a use-after-free. Stop it from calling our callbacks
+        // and release its GATT app slot so repeated failures can't exhaust them.
+        Serial.println("BLE: previous client was not torn down cleanly, not freeing it");
+        client->setClientCallbacks(nullptr);
+        if (client->getGattcIf() != ESP_GATT_IF_NONE) esp_ble_gattc_app_unregister(client->getGattcIf());
+    } else {
+        vTaskDelay(100 / portTICK_PERIOD_MS);  // let the BT task finish the disconnect handler that just ran
+        for (uint8_t i = 0; i < trackedServiceCount; i++) {
+            for (auto& ch : *trackedServices[i]->getCharacteristicsByHandle()) {
+                std::map<std::string, BLERemoteDescriptor*>* descriptors = ch.second->getDescriptors();
+                for (auto& d : *descriptors) delete d.second;
+                descriptors->clear();
+            }
+        }
+        delete client;
+    }
+    trackedServiceCount = 0;
+    trackedServicesOverflow = false;
+}
+
+BLEClient* BLE_acquireClient(BLEClientCallbacks* callbacks) {
+    BLEClient* previous = sharedClient;
+    sharedClient = BLEDevice::createClient();
+    sharedClient->setClientCallbacks(callbacks);
+    if (previous != nullptr) BLE_retireClient(previous);
+    return sharedClient;
+}
+
 enum BLE_CONNECTION_TYPE {
     BLE_TYPE_GICISKY = 0,
     BLE_TYPE_ATC_BLE_OEPL
@@ -125,8 +206,7 @@ bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
     BLE_err_counter = 0;
     uint8_t temp_Address[] = {addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]};
     Serial.printf("BLE Connecting to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
+    pClient = BLE_acquireClient(&bleClientCallbacks);
     if (!pClient->connect(BLEAddress(temp_Address))) {
         Serial.printf("BLE connection failed\r\n");
         pClient->disconnect();
@@ -139,7 +219,7 @@ bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
     if (!BLE_connected)
         return false;
     Serial.printf("BLE starting to get service\r\n");
-    BLERemoteService* pRemoteService = pClient->getService((conn_type == BLE_TYPE_GICISKY) ? gicServiceUUID : ATC_BLE_OEPL_ServiceUUID);
+    BLERemoteService* pRemoteService = BLE_getService(pClient, (conn_type == BLE_TYPE_GICISKY) ? gicServiceUUID : ATC_BLE_OEPL_ServiceUUID);
     if (pRemoteService == nullptr) {
         Serial.printf("BLE Service failed\r\n");
         pClient->disconnect();
@@ -181,9 +261,12 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
 };
 
+// One instance for all scans; this used to be `new`-ed (and leaked) on every scan, i.e. once a minute.
+static MyAdvertisedDeviceCallbacks bleScanCallbacks;
+
 void BLE_startScan(uint32_t timeout) {
     BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setAdvertisedDeviceCallbacks(&bleScanCallbacks);
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
@@ -281,8 +364,7 @@ static bool wolink_upload(uint8_t address[8]) {
     Serial.printf("Wolink connecting to %02X:%02X:%02X:%02X:%02X:%02X\r\n",
                   address[5], address[4], address[3], address[2], address[1], address[0]);
 
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
+    pClient = BLE_acquireClient(&bleClientCallbacks);
     if (!pClient->connect(BLEAddress(temp_Address))) {
         Serial.println("Wolink connect failed");
         pClient->disconnect();
@@ -300,7 +382,7 @@ static bool wolink_upload(uint8_t address[8]) {
         Serial.println("Wolink MTU negotiation failed (continuing)");
     }
 
-    BLERemoteService* svc = pClient->getService(wolinkServiceUUID);
+    BLERemoteService* svc = BLE_getService(pClient, wolinkServiceUUID);
     if (!svc) {
         Serial.println("Wolink service not found");
         pClient->disconnect();
@@ -349,8 +431,7 @@ static bool wolink_upload(uint8_t address[8]) {
     BLE_compressed_len = pack_wolink_image(address, BLE_image_buffer, BUFFER_MAX_SIZE_COMPRESSING);
     if (BLE_compressed_len == 0) {
         Serial.println("Wolink: pack failed");
-        free(BLE_image_buffer);
-        BLE_image_buffer = nullptr;
+        BLE_freeImageBuffer();
         pClient->disconnect();
         return false;
     }
@@ -369,6 +450,7 @@ static bool wolink_upload(uint8_t address[8]) {
         pkt[5] = (off >> 24) & 0xFF;
         memcpy(pkt + 6, BLE_image_buffer + off, this_n);
         dataChar->writeValue(pkt, 6 + this_n, true);
+        supervisorHeartbeat(SUPERVISED_BLE);  // a 7.5" image is ~400 chunks
         delay(15);
     }
 
@@ -411,8 +493,7 @@ static bool wolink_upload(uint8_t address[8]) {
         Serial.println("Wolink: status wait timed out");
     }
 
-    free(BLE_image_buffer);
-    BLE_image_buffer = nullptr;
+    BLE_freeImageBuffer();
     pClient->disconnect();
     return ok;
 }
@@ -422,9 +503,16 @@ void BLETask(void* parameter) {
     Serial.println("BLE task started");
     BLEDevice::init("");
     while (1) {
+        // The Arduino BLE library waits forever for GATT events (connect, discovery, reads, writes with response,
+        // scan end). If one never arrives, e.g. because the peer dropped the link mid-operation, this task hangs for
+        // good; the supervisor notices the missing heartbeat and restarts the AP.
+        supervisorHeartbeat(SUPERVISED_BLE);
         switch (ble_main_state) {
             default:
             case BLE_MAIN_STATE_IDLE:
+                // An upload that ended through the disconnect callback (which only flips the state back to IDLE)
+                // still owns its 135 KB image buffer. Freeing it here plugs that leak; no upload is running in IDLE.
+                BLE_freeImageBuffer();
                 if (millis() - last_ble_scan > (INTERVAL_BLE_SCANNING_SECONDS * 1000)) {
                     last_ble_scan = millis();
                     Serial.println("Doing the BLE Scan");
@@ -514,7 +602,7 @@ void BLETask(void* parameter) {
                                     ble_main_state = BLE_MAIN_STATE_ATC_BLE_OEPL_UPLOAD;
                                     BLE_new_notify = true;  // trigger the upload here
                                 } else {
-                                    free(BLE_image_buffer);
+                                    BLE_freeImageBuffer();
                                     if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
                                         struct espXferComplete reportStruct;
                                         memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
@@ -540,7 +628,7 @@ void BLETask(void* parameter) {
                                     ble_main_state = BLE_MAIN_STATE_UPLOAD;
                                     BLE_new_notify = true;  // trigger the upload here
                                 } else {
-                                    free(BLE_image_buffer);
+                                    BLE_freeImageBuffer();
                                     if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
                                         struct espXferComplete reportStruct;
                                         memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
@@ -580,7 +668,7 @@ void BLETask(void* parameter) {
                             break;
                         case BLE_UPLOAD_STATE_UPLOAD:
                             if (BLE_notify_buffer[2] == 0x08) {
-                                free(BLE_image_buffer);
+                                BLE_freeImageBuffer();
                                 pClient->disconnect();
                                 ble_main_state = BLE_MAIN_STATE_IDLE;
                                 BLE_last_pending_check = millis();
@@ -591,13 +679,16 @@ void BLETask(void* parameter) {
                                 BLE_err_counter = 0;
                                 BLE_curr_part = 0;
                             } else {
-                                uint32_t req_curr_part = (BLE_notify_buffer[6] << 24) | (BLE_notify_buffer[5] << 24) | (BLE_notify_buffer[4] << 24) | BLE_notify_buffer[3];
+                                // little-endian part number in bytes 3..6 (the old code shifted bytes 4..6 all by 24,
+                                // so every upload with more than 256 parts aborted here)
+                                uint32_t req_curr_part = ((uint32_t)BLE_notify_buffer[6] << 24) | ((uint32_t)BLE_notify_buffer[5] << 16) | ((uint32_t)BLE_notify_buffer[4] << 8) | BLE_notify_buffer[3];
                                 if (req_curr_part != BLE_curr_part) {
                                     Serial.printf("Something went wrong, expected req part: %i but got: %i we better abort here.\r\n", req_curr_part, BLE_curr_part);
-                                    free(BLE_image_buffer);
+                                    BLE_freeImageBuffer();
                                     pClient->disconnect();
                                     ble_main_state = BLE_MAIN_STATE_IDLE;
                                     BLE_last_pending_check = millis();
+                                    break;  // previously fell through and sent a part from the buffer it had just freed
                                 }
                                 uint32_t curr_len = 240;
                                 if (BLE_compressed_len - (BLE_curr_part * 240) < 240)
@@ -616,7 +707,7 @@ void BLETask(void* parameter) {
                 } else {
                     if (millis() - BLE_last_notify > 30000) {  // Something odd, better reset connection!
                         Serial.println("BLE err going back to IDLE");
-                        free(BLE_image_buffer);
+                        BLE_freeImageBuffer();
                         pClient->disconnect();
                         BLE_err_counter = 0;
                         ble_main_state = BLE_MAIN_STATE_IDLE;
@@ -664,7 +755,7 @@ void BLETask(void* parameter) {
                                 case BLE_CMD_ACK_IS_SHOWN:
                                 case BLE_CMD_ACK_FW_UPDATED:
                                     Serial.println("BLE Upload done");
-                                    free(BLE_image_buffer);
+                                    BLE_freeImageBuffer();
                                     pClient->disconnect();
                                     ble_main_state = BLE_MAIN_STATE_IDLE;
                                     BLE_last_pending_check = millis();
@@ -682,7 +773,7 @@ void BLETask(void* parameter) {
                 } else {
                     if (millis() - BLE_last_notify > 30000) {  // Something odd, better reset connection!
                         Serial.println("BLE err going back to IDLE");
-                        free(BLE_image_buffer);
+                        BLE_freeImageBuffer();
                         pClient->disconnect();
                         BLE_err_counter = 0;
                         ble_main_state = BLE_MAIN_STATE_IDLE;

@@ -36,6 +36,7 @@
 #endif
 #include "language.h"
 #include "settings.h"
+#include "supervisor.h"
 #include "system.h"
 #include "tag_db.h"
 #include "truetype.h"
@@ -60,6 +61,8 @@ void contentRunner() {
     memset(&wifimac[6], 0, 2);
 
     for (tagRecord *taginfo : tagDB) {
+        // One pass can render (and fetch data for) many tags; report progress per tag, not per pass.
+        supervisorHeartbeat(SUPERVISED_LOOP);
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
         if (taginfo->RSSI &&

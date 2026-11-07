@@ -4,10 +4,12 @@
 #include <ArduinoJson.h>
 
 #include "BLEDevice.h"
+#include "ble_writer.h"
 #include "nemonic_printer.h"
 #include "nemonic_raster.h"
 #include "newproto.h"
 #include "storage.h"
+#include "supervisor.h"
 #include "tag_db.h"
 
 // GATT UUIDs from Nemonic SDK (Nemonic.js:40-48).
@@ -44,6 +46,9 @@ class NemonicClientCallback : public BLEClientCallbacks {
         BLE_connected = false;
     }
 };
+
+// One instance for all prints; this used to be `new`-ed (and leaked) per print.
+static NemonicClientCallback nemonicClientCallbacks;
 
 static void nemonic_write_chunked(BLERemoteCharacteristic* c, const uint8_t* data, uint32_t len) {
     for (uint32_t off = 0; off < len; off += NEMONIC_BLE_CHUNK) {
@@ -158,8 +163,7 @@ bool nemonic_upload(uint8_t address[8]) {
     Serial.printf("Nemonic connecting to %02X:%02X:%02X:%02X:%02X:%02X\r\n",
                   reversed[0], reversed[1], reversed[2], reversed[3], reversed[4], reversed[5]);
 
-    BLEClient* client = BLEDevice::createClient();
-    client->setClientCallbacks(new NemonicClientCallback());
+    BLEClient* client = BLE_acquireClient(&nemonicClientCallbacks);
     if (!client->connect(BLEAddress(reversed))) {
         Serial.println("Nemonic: connect() returned false");
         client->disconnect();
@@ -178,7 +182,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: MTU negotiation failed (continuing)");
     }
 
-    BLERemoteService* svc = client->getService(nemonicServiceUUID);
+    BLERemoteService* svc = BLE_getService(client, nemonicServiceUUID);
     if (svc == nullptr) {
         Serial.println("Nemonic: service not found");
         client->disconnect();
@@ -252,6 +256,7 @@ bool nemonic_upload(uint8_t address[8]) {
 
         nemonic_ack_ready = false;
         nemonic_write_chunked(writeChar, frameBuf, frameLen);
+        supervisorHeartbeat(SUPERVISED_BLE);  // long labels are many frames, each waiting up to 8.5 s for an ACK
 
         if (!nemonic_wait_ack(8500)) {
             return fail("ACK timeout for split frame");

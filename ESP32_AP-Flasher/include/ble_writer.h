@@ -9,6 +9,10 @@ class NimBLEClientCallbacks;
 
 void BLETask(void* parameter);
 
+// Version (dataVer) of the queued item the current BLE upload sends. The image prepare functions load exactly that
+// item, and a completed upload reports it, so an image that replaced it meanwhile is not marked as delivered.
+extern uint64_t BLE_curr_dataVer;
+
 // The one NimBLE client all uploads share. NimBLE clients are reusable: connect() with deleteAttributes drops the
 // previous connection's service cache. Returned disconnected from any earlier peer, with the given callbacks.
 NimBLEClient* BLE_getClient(NimBLEClientCallbacks* callbacks);

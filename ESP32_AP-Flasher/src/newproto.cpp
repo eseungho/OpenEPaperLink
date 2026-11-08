@@ -426,7 +426,7 @@ void processBlockRequest(struct espBlockRequest* br) {
     Serial.printf("<RQB file %s block %d, len %d checksum %u\r\n\0", queueItem->filename, br->blockId, len, checksum);
 }
 
-void processXferComplete(struct espXferComplete* xfc, bool local) {
+void processXferComplete(struct espXferComplete* xfc, bool local, uint64_t dataVer) {
     if (config.runStatus == RUNSTATUS_STOP) {
         return;
     }
@@ -448,7 +448,10 @@ void processXferComplete(struct espXferComplete* xfc, bool local) {
 
     uint8_t md5bytes[16];
     bool haveMd5 = false;  // false for a repeated xfer complete, when the item is no longer queued
-    PendingItem* queueItem = getQueueItem(xfc->src);
+    PendingItem* queueItem = getQueueItem(xfc->src, dataVer);
+    if (queueItem == nullptr && dataVer != 0) {
+        Serial.printf("xfer complete: the delivered image was replaced meanwhile, the newer one stays queued\r\n");
+    }
     if (queueItem != nullptr) {
         if (contentFS->exists(dst_path) && contentFS->exists(queueItem->filename)) {
             contentFS->remove(dst_path);
@@ -465,7 +468,7 @@ void processXferComplete(struct espXferComplete* xfc, bool local) {
         memcpy(md5bytes, &queueItem->pendingdata.availdatainfo.dataVer, sizeof(uint64_t));
         memset(md5bytes + sizeof(uint64_t), 0, 16 - sizeof(uint64_t));
         haveMd5 = true;
-        dequeueItem(xfc->src);
+        dequeueItem(xfc->src, dataVer);
     }
 
     tagRecord* taginfo = tagRecord::findByMAC(xfc->src);

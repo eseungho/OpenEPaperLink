@@ -114,7 +114,7 @@ static NemonicOpts nemonic_parse_opts(tagRecord* tag) {
 
 bool nemonic_upload(uint8_t address[8]) {
     // 1) Fetch the rendered 1bpp raster from the pending queue.
-    PendingItem* item = getQueueItem(address, 0);
+    PendingItem* item = getQueueItem(address, BLE_curr_dataVer);
     if (item == nullptr) {
         Serial.println("Nemonic: no queue item, canceling");
         prepareCancelPending(address);

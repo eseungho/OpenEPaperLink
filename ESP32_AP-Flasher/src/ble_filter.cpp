@@ -400,7 +400,7 @@ uint8_t swapBits(uint8_t num) {
 
 uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     uint32_t t = millis();
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
         prepareCancelPending(address);
         Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
@@ -682,7 +682,7 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 #define WOLINK75_INVERT_BW         1
 #define WOLINK75_INVERT_COLOR      0
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
         prepareCancelPending(address);
         Serial.printf("Wolink pack: missing taginfo %02X%02X%02X%02X%02X%02X\r\n",
@@ -826,7 +826,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
 
 uint32_t get_ATC_BLE_OEPL_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len, uint8_t* dataType, uint8_t* dataTypeArgument, uint16_t* nextCheckIn) {
     uint32_t t = millis();
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
         prepareCancelPending(address);
         Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);

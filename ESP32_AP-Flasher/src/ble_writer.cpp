@@ -73,6 +73,7 @@ NimBLEClient* pClient = nullptr;
 uint8_t BLE_notify_buffer[256] = {0};
 
 uint32_t BLE_err_counter = 0;
+uint64_t BLE_curr_dataVer = 0;
 uint32_t BLE_curr_part = 0;
 uint32_t BLE_max_block_parts = 0;
 uint8_t BLE_mini_buff[256];
@@ -600,6 +601,10 @@ void BLETask(void* parameter) {
                     if (BLE_is_image_pending(BLE_curr_address)) {
                         Serial.println("BLE Image is pending but we wait a bit");
                         delay(5000);                                                       // We better wait here, since the pending image needs to be created first
+                        {
+                            PendingItem* curItem = getQueueItem(BLE_curr_address);
+                            BLE_curr_dataVer = (curItem != nullptr) ? curItem->pendingdata.availdatainfo.dataVer : 0;
+                        }
                         tagRecord* curTag = tagRecord::findByMAC(BLE_curr_address);
                         uint8_t curHwType = (curTag != nullptr) ? curTag->hwType : 0;
                         if (curHwType != 0 && (curHwType & 0xF0) == 0xD0) {
@@ -610,13 +615,13 @@ void BLETask(void* parameter) {
                             if (ok) {
                                 struct espXferComplete reportStruct;
                                 memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true);
+                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                 BLE_err_counter = 0;
                             } else {
                                 if (BLE_err_counter++ >= 5) {
                                     struct espXferComplete reportStruct;
                                     memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true);
+                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                     BLE_err_counter = 0;
                                 }
                             }
@@ -630,13 +635,13 @@ void BLETask(void* parameter) {
                             if (ok) {
                                 struct espXferComplete reportStruct;
                                 memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true);
+                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                 BLE_err_counter = 0;
                             } else {
                                 if (BLE_err_counter++ >= 5) {
                                     struct espXferComplete reportStruct;
                                     memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true);
+                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                     BLE_err_counter = 0;
                                 }
                             }
@@ -684,7 +689,7 @@ void BLETask(void* parameter) {
                                     if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
                                         struct espXferComplete reportStruct;
                                         memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                        processXferComplete(&reportStruct, true);
+                                        processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                     }
                                 }
                             }
@@ -710,7 +715,7 @@ void BLETask(void* parameter) {
                                     if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
                                         struct espXferComplete reportStruct;
                                         memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                        processXferComplete(&reportStruct, true);
+                                        processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                     }
                                 }
                             }
@@ -753,7 +758,7 @@ void BLETask(void* parameter) {
                                 // Done and the image is refreshing now
                                 struct espXferComplete reportStruct;
                                 memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true);
+                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                 BLE_err_counter = 0;
                                 BLE_curr_part = 0;
                             } else {
@@ -840,7 +845,7 @@ void BLETask(void* parameter) {
                                     // Done and the image is refreshing now
                                     struct espXferComplete reportStruct;
                                     memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true);
+                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
                                     BLE_err_counter = 0;
                                     BLE_max_block_parts = 0;
                                     BLE_curr_part = 0;

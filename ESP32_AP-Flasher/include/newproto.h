@@ -20,7 +20,9 @@ extern void prepareDataAvail(const uint8_t* dst);
 extern void prepareDataAvail(uint8_t* data, uint16_t len, uint8_t dataType, const uint8_t* dst);
 extern bool prepareDataAvail(String& filename, uint8_t dataType, uint8_t dataTypeArgument, const uint8_t* dst, uint16_t nextCheckin, bool resend = false);
 extern void prepareExternalDataAvail(struct pendingData* pending, IPAddress remoteIP);
-extern void processXferComplete(struct espXferComplete* xfc, bool local);
+// dataVer: the version of the item that was delivered (BLE uploads). If the queue no longer holds it (a newer image
+// replaced it during the upload), nothing is dequeued and the tag hash stays. 0 means the first queued item.
+extern void processXferComplete(struct espXferComplete* xfc, bool local, uint64_t dataVer = 0);
 extern void processXferTimeout(struct espXferComplete* xfc, bool local);
 extern void processDataReq(struct espAvailDataReq* adr, bool local, IPAddress remoteIP = IPAddress(0, 0, 0, 0));
 extern void processTagReturnData(struct espTagReturnData* trd, uint8_t len, bool local);

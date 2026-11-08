@@ -253,8 +253,8 @@ class truetypeClass {
     uint16_t *endPoints = nullptr;
     uint16_t numEndPoints = 0;
 
-    // glyf
-    ttGlyph_t glyph;
+    // glyf (zeroed: end() frees its arrays even when no glyph was read, e.g. for an empty text)
+    ttGlyph_t glyph = {};
     ttWindIntersect_t *pointsToFill = nullptr;
     void generateOutline(int16_t _x, int16_t _y, uint16_t characterSize);
     void freePointsAll();

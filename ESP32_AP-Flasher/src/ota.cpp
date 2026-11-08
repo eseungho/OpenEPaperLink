@@ -323,6 +323,11 @@ void C6firmwareUpdateTask(void* parameter) {
         if (bringAPOnline(AP_STATE_ONLINE)) {
             config.runStatus = RUNSTATUS_RUN;
             setAPstate(true, AP_STATE_ONLINE);
+        } else {
+            // As after a failed start at boot: APTask's ping recovery keeps trying (it ignores OFFLINE), and with
+            // runStatus RUN the BLE devices keep getting content meanwhile.
+            setAPstate(false, AP_STATE_FAILED);
+            config.runStatus = RUNSTATUS_RUN;
         }
 
         // Wait for version info to arrive

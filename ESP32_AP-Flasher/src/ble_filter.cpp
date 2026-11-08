@@ -738,11 +738,21 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                       (unsigned)max_len, (unsigned)out_len);
         return 0;
     }
-    if (queueItem->len < 2 * plane_size) {
-        Serial.printf("Wolink pack: source too small (%u < %u)\r\n",
-                      (unsigned)queueItem->len, (unsigned)(2 * plane_size));
+    const uint8_t dataType = queueItem->pendingdata.availdatainfo.dataType;
+    if (dataType != DATATYPE_IMG_RAW_1BPP && dataType != DATATYPE_IMG_RAW_2BPP) {
+        // a command (reboot, LED, ...) or a compressed image: nothing a Wolink tag can show
+        Serial.printf("Wolink pack: unsupported data type 0x%02X, canceling\r\n", dataType);
+        prepareCancelPending(address);
         return 0;
     }
+    // makeimage writes the colour plane only when the image has red or yellow pixels: a black and white
+    // image is a single plane and has colour bit 0 everywhere.
+    if (queueItem->len < plane_size) {
+        Serial.printf("Wolink pack: source too small (%u < %u)\r\n",
+                      (unsigned)queueItem->len, (unsigned)plane_size);
+        return 0;
+    }
+    const bool hasColor = queueItem->len >= 2 * plane_size;
 
     memset(buffer, 0, out_len);
 
@@ -762,7 +772,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                 uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
                 uint8_t mask = 0x80 >> (y % 8);
                 uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
-                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
+                uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;
                 uint8_t bw    = WOLINK75_INVERT_BW    ? (p1 ? 0 : 1) : p1;
                 uint8_t color = WOLINK75_INVERT_COLOR ? (p2 ? 0 : 1) : p2;
                 int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
@@ -789,7 +799,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                 uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
                 uint8_t mask = 0x80 >> (y % 8);
                 uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
-                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
+                uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;
                 if (WOLINK75_SWAP_RY && p2) p1 ^= 1;                 // red<->yellow
                 uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
                 int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
@@ -815,7 +825,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
             uint8_t mask = 0x80 >> (y % 8);
             uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;                 // B/W plane
-            uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;    // color plane
+            uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;    // color plane
             // black (1,0)->00, white (0,0)->01, red (0,1)->11, yellow (1,1)->10.
             uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
             int phy_y = (height - 1) - y;

@@ -19,3 +19,6 @@ void logLine(const String& text);
 bool tryLogLine(const String& text, uint32_t timeoutMs);
 void logStartUp();
 void logCoreDump();
+size_t coreDumpSize();
+size_t readCoreDump(uint8_t* buffer, size_t offset, size_t len);
+bool eraseCoreDump();

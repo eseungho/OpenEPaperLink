@@ -27,6 +27,11 @@ void initTime(void* parameter) {
     sntp_set_time_sync_notification_cb(timeSyncCallback);
     sntp_set_sync_interval(300 * 1000);
     configTzTime(config.timeZone, "time.cloudflare.com", "pool.ntp.org", "time.nist.gov");
+    // Log first: a boot that resets again before the clock syncs (no NTP, plus an early crash) would otherwise never
+    // log its reset reason, and supervisorEarlyInit() has already consumed the RTC copy of the supervisor report.
+    // Lines logged before the sync carry a time without a date.
+    logStartUp();
+    logCoreDump();
     struct tm timeinfo;
     while (millis() < 30000) {
         if (!getLocalTime(&timeinfo)) {
@@ -36,9 +41,6 @@ void initTime(void* parameter) {
             break;
         }
     }
-    // log after the time sync, so the log entries get the right timestamp
-    logStartUp();
-    logCoreDump();
     if (config.runStatus == RUNSTATUS_INIT) {
         config.runStatus = RUNSTATUS_RUN;
     }

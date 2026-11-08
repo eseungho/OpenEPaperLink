@@ -17,4 +17,6 @@
    #define ESP_CHIP_TYPE   ESP32C6_CHIP
 #endif
 
-bool FlashC6_H2(const char *Url);
+// radioTouched (optional): set when the radio was put into its bootloader, i.e. a failed update may have left it
+// without firmware. When it stays false the radio still runs its old firmware.
+bool FlashC6_H2(const char *Url, bool *radioTouched = nullptr);

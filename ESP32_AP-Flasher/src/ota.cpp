@@ -283,38 +283,41 @@ void C6firmwareUpdateTask(void* parameter) {
     supervisorMaintenance(true);
     wsSerial("Stopping AP service");
 
-    gSerialTaskState = SERIAL_STATE_STOP;
     config.runStatus = RUNSTATUS_STOP;
     setAPstate(false, AP_STATE_FLASHING);
+    stopApReader();  // the one radio reader (upstream 1ba8b87); bringAPOnline() starts it again
 #ifndef FLASHER_DEBUG_SHARED
-    extern bool rxSerialStopTask2;
+    extern volatile bool rxSerialStopTask2;
     rxSerialStopTask2 = true;
 #endif
     vTaskDelay(500 / portTICK_PERIOD_MS);
     Serial1.end();
-    setAPstate(false, AP_STATE_FLASHING);
 
     wsSerial(SHORT_CHIP_NAME " flash starting");
 
-    bool result = FlashC6_H2(urlPtr);
+    bool radioTouched = false;
+    bool result = FlashC6_H2(urlPtr, &radioTouched);
 
     wsSerial(SHORT_CHIP_NAME " flash end");
 
-    if (result) {
+    // After a flash, and also when the radio was never touched (download failed, firmware refused): bring it back
+    // right away instead of leaving the AP stopped until the supervisor restarts it.
+    if (result || !radioTouched) {
         setAPstate(false, AP_STATE_OFFLINE);
 
-        wsSerial("Finishing config...");
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        if (result) {
+            wsSerial("Finishing config...");
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+        }
 
         wsSerial("starting monitor");
-        Serial1.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
 #ifndef FLASHER_DEBUG_SHARED
         rxSerialStopTask2 = false;
         xTaskCreate(rxSerialTask2, "rxSerialTask2", 1850, NULL, 2, NULL);
 #endif
         vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        apInfo.version = 0;
+        if (result) apInfo.version = 0;
         wsSerial("bringing AP online");
         // if (bringAPOnline(AP_STATE_REQUIRED_POWER_CYCLE)) config.runStatus = RUNSTATUS_STOP;
         if (bringAPOnline(AP_STATE_ONLINE)) {
@@ -324,12 +327,14 @@ void C6firmwareUpdateTask(void* parameter) {
 
         // Wait for version info to arrive
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        if(apInfo.version == 0) {
+        if(result && apInfo.version == 0) {
            result = false;
         }
     }
 
-    if (result) {
+    if (!result && !radioTouched) {
+       wsSerial("Nothing was flashed, the radio keeps its firmware.");
+    } else if (result) {
        wsSerial("Finished!");
        char buffer[50];
        snprintf(buffer,sizeof(buffer),
@@ -345,8 +350,8 @@ void C6firmwareUpdateTask(void* parameter) {
     // wsSerial("Reboot system now");
     // wsSerial("[reboot]");
     free(urlPtr);
-    // On failure the AP stays FLASHING with runStatus STOP; the supervisor restarts it 30 min from here unless the
-    // user retries the update first.
+    // When a flash failed after the radio was touched, the AP stays FLASHING with runStatus STOP; the supervisor
+    // restarts it 30 min from here unless the user retries the update first.
     supervisorMaintenance(false);
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
@@ -359,7 +364,8 @@ void handleUpdateC6(AsyncWebServerRequest* request) {
     if (request->hasParam("url",true)) {
         const char* urlStr = request->getParam("url", true)->value().c_str();
         char* urlCopy = strdup(urlStr);
-        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 6400, urlCopy, 10, NULL);
+        // 10240: an HTTPS download left only 96 bytes of a 6400-byte stack on the Yellow AP (upstream 4ac63fc)
+        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 10240, urlCopy, 10, NULL);
         request->send(200, "Ok");
     }
     else {

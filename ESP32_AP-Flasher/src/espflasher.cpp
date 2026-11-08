@@ -203,13 +203,14 @@ bool downloadAndWriteBinary(String &filename, const char *url) {
     return Ret;
 }
 
-bool FlashC6_H2(const char *RepoUrl) {
+bool FlashC6_H2(const char *RepoUrl, bool *radioTouched) {
     String JsonFilename = "/firmware_" SHORT_CHIP_NAME ".json" ;
     bool Ret = false;
     bool bLoaderInit = false;
     bool bDownload = strlen(RepoUrl) > 0;
     int retry;
     JsonDocument jsonDoc;
+    if (radioTouched != nullptr) *radioTouched = false;
 
     LOG("%s#%d: ",__FUNCTION__,__LINE__); util::printHeap();
 
@@ -225,14 +226,30 @@ bool FlashC6_H2(const char *RepoUrl) {
         File readfile = contentFS->open(JsonFilename, "r");
         if(!readfile) {
             wsSerial("load " + JsonFilename + ": Failed to open file");
-            return true;
+            break;  // used to return true, as if the radio had been flashed
         }
         DeserializationError jsonError = deserializeJson(jsonDoc, readfile);
+        readfile.close();
 
         if(jsonError) {
             wsSerial(String("json error parsing") + JsonFilename);
             break;
         }
+
+        // Radio firmware 0x0023 and later only speaks the framed radio protocol v2 (upstream c852665), which this
+        // AP firmware doesn't have: the radio would come up "online" but never answer. Refuse it before anything
+        // is downloaded or flashed.
+        bool tooNew = false;
+        for(JsonObject obj : jsonDoc.as<JsonArray>()) {
+            const char *addressStr = obj["address"] | "";
+            const char *versionStr = obj["version"] | "";
+            if(strtoul(addressStr, NULL, 16) == 0x10000 && strtoul(versionStr, NULL, 16) >= 0x0023) {
+                wsSerial("ESP32-" SHORT_CHIP_NAME " firmware " + String(versionStr) +
+                         " needs radio protocol v2, which this AP firmware doesn't speak. Not flashed; use version 0022 or older.");
+                tooNew = true;
+            }
+        }
+        if(tooNew) break;
 
         if(!bDownload) {
            Ret = true;
@@ -274,6 +291,7 @@ bool FlashC6_H2(const char *RepoUrl) {
         };
 
         bLoaderInit = true;
+        if (radioTouched != nullptr) *radioTouched = true;  // from here on the radio is reset into its bootloader
         if(loader_port_esp32_init(&config) != ESP_LOADER_SUCCESS) {
             wsSerial("Serial initialization failed");
             break;

@@ -763,7 +763,7 @@ $('#cfgautoupdate').onclick = async function () {
 	formData.append("mac", mac);
 	formData.append("alias", $('#cfgalias').value);
 
-	var repo = apConfig.repo || 'OpenEPaperLink/OpenEPaperLink';
+	var repo = apConfig.repo || 'eseungho/OpenEPaperLink';
 	var infourl = "https://raw.githubusercontent.com/" + repo + "/master/binaries/Tag/tagotaversions.json";
 	var info = "";
 	await fetch(infourl, { method: 'GET' }).then(await function (response) { return response.json(); }).then(await function (json) { info = json; });
@@ -1528,7 +1528,7 @@ $('#activefilter').addEventListener('click', (event) => {
 const downloadTagtype = async (hwtype) => {
 	try {
 		console.log("download tagtype " + hwtype);
-		let repo = apConfig.repo || 'OpenEPaperLink/OpenEPaperLink';
+		let repo = apConfig.repo || 'eseungho/OpenEPaperLink';
 		let url = "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + hwtype + ".json";
 		console.log(url);
 

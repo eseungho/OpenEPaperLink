@@ -342,7 +342,7 @@ void initAPconfig() {
     // default wifi power 8.5 dbM
     // see https://github.com/espressif/arduino-esp32/blob/master/libraries/WiFi/src/WiFiGeneric.h#L111
     config.wifiPower = APconfig["wifipower"].is<uint8_t>() ? APconfig["wifipower"] : 34;
-    config.repo = APconfig["repo"].is<String>() ? APconfig["repo"].as<String>() : String("OpenEPaperLink/OpenEPaperLink");
+    config.repo = APconfig["repo"].is<String>() ? APconfig["repo"].as<String>() : String("eseungho/OpenEPaperLink");
     config.env = APconfig["env"].is<String>() ? APconfig["env"].as<String>() : String(STR(BUILD_ENV_NAME));
     if (APconfig["timezone"]) {
         strlcpy(config.timeZone, APconfig["timezone"], sizeof(config.timeZone));

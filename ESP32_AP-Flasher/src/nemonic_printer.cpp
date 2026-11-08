@@ -5,6 +5,8 @@
 
 #include <NimBLEDevice.h>
 
+#include <memory>
+
 #include "ble_writer.h"
 #include "nemonic_printer.h"
 #include "nemonic_raster.h"
@@ -118,36 +120,42 @@ bool nemonic_upload(uint8_t address[8]) {
         prepareCancelPending(address);
         return false;
     }
-    if (item->data == nullptr) {
-        fs::File f = contentFS->open(item->filename);
-        if (!f) {
-            Serial.printf("Nemonic: missing file %s, canceling\r\n", item->filename);
-            prepareCancelPending(address);
-            return false;
-        }
-        item->data = getDataForFile(f);
-        f.close();
+    if (!loadQueueItemData(item)) {
+        Serial.printf("Nemonic: can't load %s, canceling\r\n", item->filename);
+        prepareCancelPending(address);
+        return false;
     }
-    if (item->data == nullptr || item->len == 0) {
+    if (item->len == 0) {
         Serial.println("Nemonic: empty raster, canceling");
         prepareCancelPending(address);
         return false;
     }
+    // Print from a private copy: other tasks can replace or dequeue the queue item meanwhile, and a long label
+    // with slow ACKs can take longer than a dequeued item is kept before it is freed.
+    const uint32_t rasterLen = item->len;
+    std::unique_ptr<uint8_t, void (*)(void*)> rasterCopy(
+        (uint8_t*)heap_caps_malloc(rasterLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), free);
+    if (!rasterCopy) {
+        Serial.println("Nemonic: no memory for the raster copy, retrying later");
+        return false;
+    }
+    memcpy(rasterCopy.get(), item->data, rasterLen);
+    const uint8_t* raster = rasterCopy.get();
 
     // 2) Derive height; trim trailing white rows; sanity check.
-    if (item->len % NEMONIC_WIDTH_BYTES != 0) {
+    if (rasterLen % NEMONIC_WIDTH_BYTES != 0) {
         Serial.printf("Nemonic: raster size %u not a multiple of %u (width %u dots)\r\n",
-                      (unsigned)item->len, NEMONIC_WIDTH_BYTES, NEMONIC_WIDTH_DOTS);
+                      (unsigned)rasterLen, NEMONIC_WIDTH_BYTES, NEMONIC_WIDTH_DOTS);
         prepareCancelPending(address);
         return false;
     }
-    uint16_t fullHeight = (uint16_t)(item->len / NEMONIC_WIDTH_BYTES);
+    uint16_t fullHeight = (uint16_t)(rasterLen / NEMONIC_WIDTH_BYTES);
     if (fullHeight == 0 || fullHeight > NEMONIC_MAX_HEIGHT) {
         Serial.printf("Nemonic: invalid height %u (max %u)\r\n", fullHeight, NEMONIC_MAX_HEIGHT);
         prepareCancelPending(address);
         return false;
     }
-    uint16_t height = nemonicTrimTrailingWhite(item->data, NEMONIC_WIDTH_BYTES, fullHeight);
+    uint16_t height = nemonicTrimTrailingWhite(raster, NEMONIC_WIDTH_BYTES, fullHeight);
     uint32_t rasterBytes = (uint32_t)NEMONIC_WIDTH_BYTES * height;
     uint32_t totalPayload = NEMONIC_FIRST_PREPEND + rasterBytes;
     uint8_t  totalFrames  = nemonicSplitCount(totalPayload);
@@ -249,8 +257,7 @@ bool nemonic_upload(uint8_t address[8]) {
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
-    // 8) Split frames. Stream raster directly from item->data; build each
-    //    frame in frameBuf and ship it.
+    // 8) Split frames. Stream the raster copy; build each frame in frameBuf and ship it.
     uint32_t cursor = 0;
     for (uint8_t idx = 0; idx < totalFrames; idx++) {
         uint32_t remaining = totalPayload - cursor;
@@ -263,10 +270,10 @@ bool nemonic_upload(uint8_t address[8]) {
             payload[2] = (uint8_t)(height & 0xFF);
             payload[3] = (uint8_t)((height >> 8) & 0xFF);
             uint32_t rasterChunk = thisLen - NEMONIC_FIRST_PREPEND;
-            memcpy(payload + NEMONIC_FIRST_PREPEND, item->data, rasterChunk);
+            memcpy(payload + NEMONIC_FIRST_PREPEND, raster, rasterChunk);
         } else {
             uint32_t rasterOffset = cursor - NEMONIC_FIRST_PREPEND;
-            memcpy(payload, item->data + rasterOffset, thisLen);
+            memcpy(payload, raster + rasterOffset, thisLen);
         }
         cursor += thisLen;
 

@@ -8,6 +8,7 @@
 
 #include "contentmanager.h"
 #include "flasher.h"
+#include "newproto.h"
 #include "serialap.h"
 #include "settings.h"
 #include "storage.h"
@@ -189,6 +190,10 @@ void setup() {
 
 void loop() {
     supervisorLoopTick();
+    // Here and not in contentRunner(): that doesn't run while the radio is down or the AP is stopped, and
+    // BLE uploads keep retiring queue items (with their image data) meanwhile.
+    freeDeletedRecords();
+    freeRetiredQueueItems();
     ws.cleanupClients();
     wm.poll();
 

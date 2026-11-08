@@ -689,15 +689,10 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                       address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("Wolink pack: no file " + String(queueItem->filename) + ", canceling\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        Serial.print("Wolink pack: can't load " + String(queueItem->filename) + ", canceling\r\n");
+        prepareCancelPending(address);
+        return 0;
     }
 
     tagRecord* taginfo = tagRecord::findByMAC(address);

@@ -60,8 +60,6 @@ void contentRunner() {
     WiFi.macAddress(wifimac);
     memset(&wifimac[6], 0, 2);
 
-    freeDeletedRecords();
-    freeRetiredQueueItems();
     // iterate over a copy: drawNew() can take seconds and must not hold the tagDB lock
     for (tagRecord *taginfo : tagDBSnapshot()) {
         // One pass can render (and fetch data for) many tags; report progress per tag, not per pass, and let a pending

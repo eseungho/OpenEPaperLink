@@ -7,6 +7,8 @@
 #include <MD5Builder.h>
 #include <Update.h>
 
+#include <atomic>
+
 #include "flasher.h"
 #include "espflasher.h"
 #include "leds.h"
@@ -252,7 +254,10 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
     }
 
     httpClient.end();
-    config.runStatus = RUNSTATUS_RUN;
+    // While the AP is FLASHING, the C6 update owns runStatus (a flash still running, or one that failed after the
+    // radio was put into its bootloader). Keep its STOP: the C6 task sets RUN when it finishes, or the supervisor's
+    // 30-minute STOP restart brings the radio back.
+    if (apInfo.state != AP_STATE_FLASHING) config.runStatus = RUNSTATUS_RUN;
     supervisorMaintenance(false);
 }
 
@@ -276,6 +281,9 @@ void handleRollback(AsyncWebServerRequest* request) {
 }
 
 #ifdef C6_OTA_FLASHING
+// One radio update at a time: updates share the debug UART, the reset/boot pins and the firmware files
+static std::atomic<bool> c6UpdateBusy{false};
+
 void C6firmwareUpdateTask(void* parameter) {
     char* urlPtr = reinterpret_cast<char*>(parameter);
 
@@ -292,6 +300,8 @@ void C6firmwareUpdateTask(void* parameter) {
 #endif
     vTaskDelay(500 / portTICK_PERIOD_MS);
     Serial1.end();
+    // again: APTask may have overwritten FLASHING in the first 0.5 s (a recovery or an ACK that was in flight)
+    setAPstate(false, AP_STATE_FLASHING);
 
     wsSerial(SHORT_CHIP_NAME " flash starting");
 
@@ -358,6 +368,7 @@ void C6firmwareUpdateTask(void* parameter) {
     // When a flash failed after the radio was touched, the AP stays FLASHING with runStatus STOP; the supervisor
     // restarts it 30 min from here unless the user retries the update first.
     supervisorMaintenance(false);
+    c6UpdateBusy = false;  // nothing below touches the radio
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
 }
@@ -367,10 +378,19 @@ void C6firmwareUpdateTask(void* parameter) {
 void handleUpdateC6(AsyncWebServerRequest* request) {
 #if defined C6_OTA_FLASHING
     if (request->hasParam("url",true)) {
-        const char* urlStr = request->getParam("url", true)->value().c_str();
-        char* urlCopy = strdup(urlStr);
+        bool expected = false;
+        if (!c6UpdateBusy.compare_exchange_strong(expected, true)) {
+            request->send(409, "text/plain", "A radio update is already running");
+            return;
+        }
+        char* urlCopy = strdup(request->getParam("url", true)->value().c_str());
         // 10240: an HTTPS download left only 96 bytes of a 6400-byte stack on the Yellow AP (upstream 4ac63fc)
-        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 10240, urlCopy, 10, NULL);
+        if (urlCopy == nullptr || xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 10240, urlCopy, 10, NULL) != pdPASS) {
+            free(urlCopy);
+            c6UpdateBusy = false;
+            request->send(500, "text/plain", "Could not start the update");
+            return;
+        }
         request->send(200, "Ok");
     }
     else {

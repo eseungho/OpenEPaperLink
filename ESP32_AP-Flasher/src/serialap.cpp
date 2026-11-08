@@ -1190,11 +1190,15 @@ void APTask(void* parameter) {
                 setAPstate(false, AP_STATE_WAIT_RESET);
                 if (!bringAPOnline()) {
                     // tried to reset the AP, but we failed... Maybe the AP-Tag died?
-                    setAPstate(false, AP_STATE_FAILED);
+                    // A C6 update may have taken the radio meanwhile (bringAPOnline() then fails on purpose): leave
+                    // FLASHING alone, or this loop resets the C6 in the middle of the flash 30 s later.
+                    if (apInfo.state != AP_STATE_FLASHING) {
+                        setAPstate(false, AP_STATE_FAILED);
 #ifdef HAS_RGB_LED
-                    showColorPattern(CRGB::Yellow, CRGB::Yellow, CRGB::Red);
+                        showColorPattern(CRGB::Yellow, CRGB::Yellow, CRGB::Red);
 #endif
-                    lastAPActivity = millis();  // we set this to retrigger a recovery in AP_ACTIVITY_MAX_INTERVAL seconds
+                        lastAPActivity = millis();  // we set this to retrigger a recovery in AP_ACTIVITY_MAX_INTERVAL seconds
+                    }
                 } else {
                     setAPstate(true, AP_STATE_ONLINE);
                     attempts = 0;

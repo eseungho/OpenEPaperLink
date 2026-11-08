@@ -9,6 +9,7 @@
 #include "newproto.h"
 #include "supervisor.h"
 #include "tag_db.h"
+#include "web.h"
 #ifdef HAS_NEMONIC_PRINTER
 #include "nemonic_printer.h"
 #endif
@@ -207,7 +208,7 @@ enum BLE_CONNECTION_TYPE {
 };
 
 bool BLE_connect(uint8_t addr[8], BLE_CONNECTION_TYPE conn_type) {
-    BLE_err_counter = 0;
+    // BLE_err_counter is only for block-part retries now; resetting it here kept the old give-up from ever firing
     ctrlChar = nullptr;  // they belong to the previous connection's attribute tree, which connect() deletes
     imgChar = nullptr;
     Serial.printf("BLE Connecting to: %02X:%02X:%02X:%02X:%02X:%02X\r\n", addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
@@ -575,6 +576,63 @@ static bool wolink_upload(uint8_t address[8]) {
     return ok;
 }
 
+#define BLE_MAX_TRIES 5  // per queued item and device
+
+// The item BLETask sent (BLE_curr_dataVer) reached the device: count the update, start the tries afresh.
+static void BLE_reportDelivered() {
+    struct espXferComplete reportStruct;
+    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
+    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
+    BLE_clear_attempts(BLE_curr_address);
+}
+
+// Give the item up. Reporting it complete, as before, made it the image the AP believes the device shows (hash,
+// preview, update count), so the same content was never sent again. A display gets processXferTimeout(): its queue
+// is cleared and its hash stays. The label printer only loses this label; its other queued labels stay.
+static void BLE_giveUp() {
+    char buffer[96];
+    snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X%02X%02X BLE upload given up after %d tries",
+             BLE_curr_address[7], BLE_curr_address[6], BLE_curr_address[5], BLE_curr_address[4], BLE_curr_address[3],
+             BLE_curr_address[2], BLE_curr_address[1], BLE_curr_address[0], BLE_MAX_TRIES);
+    Serial.println(buffer);
+    wsErr(buffer);
+    BLE_clear_attempts(BLE_curr_address);
+    const tagRecord* taginfo = tagRecord::findByMAC(BLE_curr_address);
+    if (taginfo != nullptr && taginfo->hwType == NEMONIC_BLE_MIP201) {
+        dropQueueItem(BLE_curr_address, BLE_curr_dataVer);
+        return;
+    }
+    struct espXferComplete reportStruct;
+    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
+    processXferTimeout(&reportStruct, true);
+}
+
+// A try failed: no connection, a refused part, no notify for 30 s, a dropped link. BLE_is_image_pending() counted
+// it and waits before the next one; after BLE_MAX_TRIES the item is given up.
+static void BLE_attemptFailed(const char* why) {
+    BLE_freeImageBuffer();
+    if (pClient != nullptr && pClient->isConnected()) pClient->disconnect();
+    ble_main_state = BLE_MAIN_STATE_IDLE;
+    BLE_last_pending_check = millis();
+    BLE_curr_part = 0;
+    const uint32_t tries = BLE_get_attempts(BLE_curr_address);
+    Serial.printf("BLE upload failed (%s), try %u of %u\r\n", why, (unsigned)tries, (unsigned)BLE_MAX_TRIES);
+    if (tries >= BLE_MAX_TRIES) BLE_giveUp();
+}
+
+// The item can't be delivered at all (e.g. a label raster of the wrong size): drop just that item.
+static void BLE_dropItem(const char* why) {
+    char buffer[112];
+    snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X%02X%02X BLE item dropped: %s",
+             BLE_curr_address[7], BLE_curr_address[6], BLE_curr_address[5], BLE_curr_address[4], BLE_curr_address[3],
+             BLE_curr_address[2], BLE_curr_address[1], BLE_curr_address[0], why);
+    Serial.println(buffer);
+    wsErr(buffer);
+    dropQueueItem(BLE_curr_address, BLE_curr_dataVer);
+    BLE_clear_attempts(BLE_curr_address);
+    BLE_last_pending_check = millis();
+}
+
 void BLETask(void* parameter) {
     vTaskDelay(5000 / portTICK_PERIOD_MS);
     Serial.println("BLE task started");
@@ -589,8 +647,9 @@ void BLETask(void* parameter) {
             default:
             case BLE_MAIN_STATE_IDLE:
                 // An upload that ended through the disconnect callback (which only flips the state back to IDLE)
-                // still owns its 135 KB image buffer. Freeing it here plugs that leak; no upload is running in IDLE.
-                BLE_freeImageBuffer();
+                // still owns its 135 KB image buffer: the link dropped in the middle of it. That is a failed try
+                // (BLE_attemptFailed() frees the buffer); no upload is running in IDLE.
+                if (BLE_image_buffer != nullptr) BLE_attemptFailed("link dropped during the upload");
                 // First scan right away: uploads need the address types it records (see BLE_tagAddress()).
                 if (last_ble_scan == 0 || millis() - last_ble_scan > (INTERVAL_BLE_SCANNING_SECONDS * 1000)) {
                     last_ble_scan = millis();
@@ -608,42 +667,28 @@ void BLETask(void* parameter) {
                         tagRecord* curTag = tagRecord::findByMAC(BLE_curr_address);
                         uint8_t curHwType = (curTag != nullptr) ? curTag->hwType : 0;
                         if (curHwType != 0 && (curHwType & 0xF0) == 0xD0) {
-                            // Wolink/Zhsunyco family. The whole upload runs synchronously
-                            // inside this task, so we stay in IDLE and report completion
-                            // (or cancel) directly when wolink_upload() returns.
-                            bool ok = wolink_upload(BLE_curr_address);
-                            if (ok) {
-                                struct espXferComplete reportStruct;
-                                memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                BLE_err_counter = 0;
+                            // Wolink/Zhsunyco family. The whole upload runs synchronously inside this task, so we
+                            // stay in IDLE and report the result directly when wolink_upload() returns.
+                            if (wolink_upload(BLE_curr_address)) {
+                                BLE_reportDelivered();
                             } else {
-                                if (BLE_err_counter++ >= 5) {
-                                    struct espXferComplete reportStruct;
-                                    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                    BLE_err_counter = 0;
-                                }
+                                BLE_attemptFailed("Wolink upload failed");
                             }
                             BLE_last_pending_check = millis();
 #ifdef HAS_NEMONIC_PRINTER
-                        } else if (curHwType == 0xE6) {
-                            // Nemonic MIP-201 BLE label printer. Same synchronous-upload
-                            // pattern as Wolink: connect, push the SDK split-frame
-                            // sequence, trigger PRINT, disconnect.
-                            bool ok = nemonic_upload(BLE_curr_address);
-                            if (ok) {
-                                struct espXferComplete reportStruct;
-                                memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                BLE_err_counter = 0;
-                            } else {
-                                if (BLE_err_counter++ >= 5) {
-                                    struct espXferComplete reportStruct;
-                                    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                    BLE_err_counter = 0;
-                                }
+                        } else if (curHwType == NEMONIC_BLE_MIP201) {
+                            // Nemonic MIP-201 BLE label printer. Same synchronous pattern as Wolink: connect, push
+                            // the SDK split-frame sequence, trigger PRINT, disconnect.
+                            switch (nemonic_upload(BLE_curr_address)) {
+                                case NEMONIC_DELIVERED:
+                                    BLE_reportDelivered();
+                                    break;
+                                case NEMONIC_DROP:
+                                    BLE_dropItem("the label can't be printed");
+                                    break;
+                                default:
+                                    BLE_attemptFailed("Nemonic print failed");
+                                    break;
                             }
                             BLE_last_pending_check = millis();
 #endif
@@ -653,6 +698,7 @@ void BLETask(void* parameter) {
                             if (BLE_image_buffer == nullptr) {
                                 Serial.println("BLE Could not create buffer!");
                                 BLE_compressed_len = 0;
+                                BLE_attemptFailed("no memory for the image buffer");
                             } else {
                                 uint8_t dataType = 0x00;
                                 uint8_t dataTypeArgument = 0x00;
@@ -685,12 +731,7 @@ void BLETask(void* parameter) {
                                     ble_main_state = BLE_MAIN_STATE_ATC_BLE_OEPL_UPLOAD;
                                     BLE_new_notify = true;  // trigger the upload here
                                 } else {
-                                    BLE_freeImageBuffer();
-                                    if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
-                                        struct espXferComplete reportStruct;
-                                        memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                        processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                    }
+                                    BLE_attemptFailed(BLE_compressed_len ? "connection failed" : "no image data");
                                 }
                             }
                         } else {  // This is a Gicisky display
@@ -699,6 +740,7 @@ void BLETask(void* parameter) {
                             if (BLE_image_buffer == nullptr) {
                                 Serial.println("BLE Could not create buffer!");
                                 BLE_compressed_len = 0;
+                                BLE_attemptFailed("no memory for the image buffer");
                             } else {
                                 BLE_compressed_len = compress_image(BLE_curr_address, BLE_image_buffer, BUFFER_MAX_SIZE_COMPRESSING);
                                 Serial.printf("BLE Compressed Length: %i\r\n", BLE_compressed_len);
@@ -711,12 +753,7 @@ void BLETask(void* parameter) {
                                     ble_main_state = BLE_MAIN_STATE_UPLOAD;
                                     BLE_new_notify = true;  // trigger the upload here
                                 } else {
-                                    BLE_freeImageBuffer();
-                                    if (BLE_err_counter++ >= 5) {  // 5 Retries for a BLE Connection
-                                        struct espXferComplete reportStruct;
-                                        memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                        processXferComplete(&reportStruct, true, BLE_curr_dataVer);
-                                    }
+                                    BLE_attemptFailed(BLE_compressed_len ? "connection failed" : "no image data");
                                 }
                             }
                         }
@@ -751,14 +788,13 @@ void BLETask(void* parameter) {
                             break;
                         case BLE_UPLOAD_STATE_UPLOAD:
                             if (BLE_notify_buffer[2] == 0x08) {
+                                // the buffer goes first, so the disconnect callback doesn't count a dropped link
                                 BLE_freeImageBuffer();
                                 pClient->disconnect();
                                 ble_main_state = BLE_MAIN_STATE_IDLE;
                                 BLE_last_pending_check = millis();
                                 // Done and the image is refreshing now
-                                struct espXferComplete reportStruct;
-                                memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                processXferComplete(&reportStruct, true, BLE_curr_dataVer);
+                                BLE_reportDelivered();
                                 BLE_err_counter = 0;
                                 BLE_curr_part = 0;
                             } else {
@@ -767,10 +803,7 @@ void BLETask(void* parameter) {
                                 uint32_t req_curr_part = ((uint32_t)BLE_notify_buffer[6] << 24) | ((uint32_t)BLE_notify_buffer[5] << 16) | ((uint32_t)BLE_notify_buffer[4] << 8) | BLE_notify_buffer[3];
                                 if (req_curr_part != BLE_curr_part) {
                                     Serial.printf("Something went wrong, expected req part: %i but got: %i we better abort here.\r\n", req_curr_part, BLE_curr_part);
-                                    BLE_freeImageBuffer();
-                                    pClient->disconnect();
-                                    ble_main_state = BLE_MAIN_STATE_IDLE;
-                                    BLE_last_pending_check = millis();
+                                    BLE_attemptFailed("unexpected part request");
                                     break;  // previously fell through and sent a part from the buffer it had just freed
                                 }
                                 uint32_t curr_len = 240;
@@ -790,11 +823,8 @@ void BLETask(void* parameter) {
                 } else {
                     if (millis() - BLE_last_notify > 30000) {  // Something odd, better reset connection!
                         Serial.println("BLE err going back to IDLE");
-                        BLE_freeImageBuffer();
-                        pClient->disconnect();
                         BLE_err_counter = 0;
-                        ble_main_state = BLE_MAIN_STATE_IDLE;
-                        BLE_last_pending_check = millis();
+                        BLE_attemptFailed("no notify for 30 s");
                     }
                 }
                 break;
@@ -833,19 +863,24 @@ void BLETask(void* parameter) {
                                     if (BLE_curr_part <= BLE_max_block_parts && BLE_err_counter++ < 15) {
                                         ATC_BLE_OEPL_SendPart(BLEblkRequst.blockId, BLE_curr_part);
                                         break;
-                                    }  // FALLTROUGH!!! We cancel the upload if we land here since we dont have so many parts of a block!
+                                    }
+                                    // too many errors on one block: the display didn't get the image (as upstream
+                                    // 5632ac3; this used to fall through and report the upload as done)
+                                    BLE_err_counter = 0;
+                                    BLE_max_block_parts = 0;
+                                    BLE_attemptFailed("too many block part errors");
+                                    break;
                                 case BLE_CMD_ACK:
                                 case BLE_CMD_ACK_IS_SHOWN:
                                 case BLE_CMD_ACK_FW_UPDATED:
                                     Serial.println("BLE Upload done");
+                                    // the buffer goes first, so the disconnect callback doesn't count a dropped link
                                     BLE_freeImageBuffer();
                                     pClient->disconnect();
                                     ble_main_state = BLE_MAIN_STATE_IDLE;
                                     BLE_last_pending_check = millis();
                                     // Done and the image is refreshing now
-                                    struct espXferComplete reportStruct;
-                                    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-                                    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
+                                    BLE_reportDelivered();
                                     BLE_err_counter = 0;
                                     BLE_max_block_parts = 0;
                                     BLE_curr_part = 0;
@@ -856,11 +891,8 @@ void BLETask(void* parameter) {
                 } else {
                     if (millis() - BLE_last_notify > 30000) {  // Something odd, better reset connection!
                         Serial.println("BLE err going back to IDLE");
-                        BLE_freeImageBuffer();
-                        pClient->disconnect();
                         BLE_err_counter = 0;
-                        ble_main_state = BLE_MAIN_STATE_IDLE;
-                        BLE_last_pending_check = millis();
+                        BLE_attemptFailed("no notify for 30 s");
                     }
                 }
                 break;

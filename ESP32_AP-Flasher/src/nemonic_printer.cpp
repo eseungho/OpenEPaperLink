@@ -112,23 +112,22 @@ static NemonicOpts nemonic_parse_opts(tagRecord* tag) {
     return o;
 }
 
-bool nemonic_upload(uint8_t address[8]) {
+NemonicResult nemonic_upload(uint8_t address[8]) {
     // 1) Fetch the rendered 1bpp raster from the pending queue.
     PendingItem* item = getQueueItem(address, BLE_curr_dataVer);
     if (item == nullptr) {
-        Serial.println("Nemonic: no queue item, canceling");
-        prepareCancelPending(address);
-        return false;
+        // replaced or cleared since BLETask picked it: the next round takes what is queued now
+        Serial.println("Nemonic: the queued label is gone");
+        return NEMONIC_RETRY;
     }
     if (!loadQueueItemData(item)) {
-        Serial.printf("Nemonic: can't load %s, canceling\r\n", item->filename);
-        prepareCancelPending(address);
-        return false;
+        // missing file or no memory: retried, and given up (only this label) after the last try
+        Serial.printf("Nemonic: can't load %s\r\n", item->filename);
+        return NEMONIC_RETRY;
     }
     if (item->len == 0) {
-        Serial.println("Nemonic: empty raster, canceling");
-        prepareCancelPending(address);
-        return false;
+        Serial.println("Nemonic: empty raster");
+        return NEMONIC_DROP;
     }
     // Print from a private copy: other tasks can replace or dequeue the queue item meanwhile, and a long label
     // with slow ACKs can take longer than a dequeued item is kept before it is freed.
@@ -137,7 +136,7 @@ bool nemonic_upload(uint8_t address[8]) {
         (uint8_t*)heap_caps_malloc(rasterLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), free);
     if (!rasterCopy) {
         Serial.println("Nemonic: no memory for the raster copy, retrying later");
-        return false;
+        return NEMONIC_RETRY;
     }
     memcpy(rasterCopy.get(), item->data, rasterLen);
     const uint8_t* raster = rasterCopy.get();
@@ -146,14 +145,12 @@ bool nemonic_upload(uint8_t address[8]) {
     if (rasterLen % NEMONIC_WIDTH_BYTES != 0) {
         Serial.printf("Nemonic: raster size %u not a multiple of %u (width %u dots)\r\n",
                       (unsigned)rasterLen, NEMONIC_WIDTH_BYTES, NEMONIC_WIDTH_DOTS);
-        prepareCancelPending(address);
-        return false;
+        return NEMONIC_DROP;
     }
     uint16_t fullHeight = (uint16_t)(rasterLen / NEMONIC_WIDTH_BYTES);
     if (fullHeight == 0 || fullHeight > NEMONIC_MAX_HEIGHT) {
         Serial.printf("Nemonic: invalid height %u (max %u)\r\n", fullHeight, NEMONIC_MAX_HEIGHT);
-        prepareCancelPending(address);
-        return false;
+        return NEMONIC_DROP;
     }
     uint16_t height = nemonicTrimTrailingWhite(raster, NEMONIC_WIDTH_BYTES, fullHeight);
     uint32_t rasterBytes = (uint32_t)NEMONIC_WIDTH_BYTES * height;
@@ -175,8 +172,7 @@ bool nemonic_upload(uint8_t address[8]) {
     if (frameBuf == nullptr) frameBuf = (uint8_t*)malloc(NEMONIC_FRAME_HEADER + NEMONIC_SPLIT_MAX);
     if (frameBuf == nullptr) {
         Serial.println("Nemonic: frameBuf alloc failed");
-        prepareCancelPending(address);
-        return false;
+        return NEMONIC_RETRY;
     }
 
     // 5) BLE connect. tag_db stores the address LSB-first; BLE_tagAddress() converts it, this is just for the log.
@@ -188,7 +184,7 @@ bool nemonic_upload(uint8_t address[8]) {
     if (client == nullptr || !client->connect(BLE_tagAddress(address), true)) {
         Serial.println("Nemonic: connect() returned false");
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     uint32_t t0 = millis();
     while (!BLE_connected && millis() - t0 < 5000) vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -196,7 +192,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: connection did not settle");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     // NimBLE negotiates up to 255 on connect. Chunks longer than MTU-3 would become long writes, which NimBLE
     // silently truncates if the printer rejects them, so size them from the MTU.
@@ -205,7 +201,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.printf("Nemonic: MTU %u too small\r\n", mtu);
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     nemonic_chunk = (mtu - 3) < NEMONIC_BLE_CHUNK ? (mtu - 3) : NEMONIC_BLE_CHUNK;
 
@@ -214,7 +210,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: service not found");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     NimBLERemoteCharacteristic* writeChar  = svc->getCharacteristic(nemonicWriteUUID);
     NimBLERemoteCharacteristic* notifyChar = svc->getCharacteristic(nemonicNotifyUUID);
@@ -222,14 +218,14 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: characteristic discovery failed");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     nemonic_ack_ready = false;
     if (!notifyChar->canNotify()) {
         Serial.println("Nemonic: notify characteristic does not support notify");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     if (!notifyChar->subscribe(true, nemonicNotifyCb)) {
         // registerForNotify() ignored a failed CCCD write too; notifications may still arrive.
@@ -240,7 +236,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.printf("Nemonic FAIL: %s\r\n", why);
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     };
 
     // 6) INIT
@@ -299,7 +295,9 @@ bool nemonic_upload(uint8_t address[8]) {
     // 9) PRINT (cut or no-cut), or skip if debug noprint set.
     if (!opts.noprint) {
         uint8_t printCmd[2] = { 0x1B, (uint8_t)(opts.cut ? 0x50 : 0x51) };
-        if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) return fail("PRINT write failed");
+        // Once PRINT is handed to the stack the label may print, so it counts as delivered even if the write
+        // reports an error: printing it twice is worse than missing one.
+        if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) Serial.println("Nemonic: PRINT write reported an error");
         vTaskDelay(50 / portTICK_PERIOD_MS);
     } else {
         Serial.println("Nemonic: noprint=1, skipping final PRINT");
@@ -308,7 +306,7 @@ bool nemonic_upload(uint8_t address[8]) {
     // 10) Done.
     client->disconnect();
     free(frameBuf);
-    return true;
+    return NEMONIC_DELIVERED;
 }
 
 #endif

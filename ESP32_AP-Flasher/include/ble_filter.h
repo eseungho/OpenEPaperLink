@@ -15,7 +15,11 @@ struct BLE_ScanRecord {
 uint8_t gicToOEPLtype(uint8_t gicType);
 uint8_t wolinkToOEPLtype(uint16_t modelId, uint16_t hwVersion);
 bool BLE_filter_add_device(const BLE_ScanRecord& device);
+// Picks the next device to upload to (fewest tries first, see the .cpp) and counts the try.
 bool BLE_is_image_pending(uint8_t address[8]);
+// Tries of the current round of uploads to a device; cleared once it got its item or the item was given up.
+void BLE_clear_attempts(const uint8_t address[8]);
+uint32_t BLE_get_attempts(const uint8_t address[8]);
 uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len);
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len);
 uint32_t get_ATC_BLE_OEPL_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len, uint8_t* dataType, uint8_t* dataTypeArgument, uint16_t* nextCheckIn);

@@ -979,6 +979,27 @@ static void removeFiles(const std::vector<String>& files) {
     }
 }
 
+bool isBleTarget(const uint8_t mac[8]) {
+    const tagRecord* taginfo = tagRecord::findByMAC(mac);
+    return isBleTag(mac, taginfo != nullptr ? taginfo->hwType : 0);
+}
+
+void dropQueueItem(const uint8_t* targetMac, const uint64_t dataVer) {
+    std::vector<String> obsoleteFiles;
+    {
+        std::lock_guard<std::recursive_mutex> lock(queueMutex);
+        PendingItem* item = getQueueItem(targetMac, dataVer);
+        if (item == nullptr) return;
+        obsoleteFiles.push_back(item->filename);
+        dequeueItem(targetMac, dataVer);
+        keepUnusedPendingFiles(obsoleteFiles, nullptr);
+    }
+    removeFiles(obsoleteFiles);
+    tagRecord* taginfo = tagRecord::findByMAC(targetMac);
+    if (taginfo != nullptr) taginfo->pendingCount = countQueueItem(targetMac);
+    wsSendTaginfo(targetMac, SYNC_TAGSTATUS);
+}
+
 void dequeueAllItems(const uint8_t* targetMac) {
     // the .pending files go too: nothing removes them later, until the next boot
     std::vector<String> obsoleteFiles;

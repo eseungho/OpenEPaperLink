@@ -279,6 +279,9 @@ blksend:
 
 bool sendDataAvail(struct pendingData* pending) {
     if (apInfo.state == AP_STATE_NORADIO) return true;
+    // BLETask serves BLE displays and printers. The radio never hears them: it would time the slot out after
+    // attemptsLeft minutes and the XTO would drop the tag's queue, also in the middle of a BLE upload.
+    if (isBleTarget(pending->targetMac)) return true;
     if (!apInfo.isOnline) return false;
     if (!txStart()) return false;
     addCRC(pending, sizeof(struct pendingData));
@@ -301,6 +304,7 @@ bool sendDataAvail(struct pendingData* pending) {
 }
 bool sendCancelPending(struct pendingData* pending) {
     if (apInfo.state == AP_STATE_NORADIO) return true;
+    if (isBleTarget(pending->targetMac)) return true;  // nothing in the radio to cancel (see sendDataAvail)
     if (!apInfo.isOnline) return false;
     if (!txStart()) return false;
     addCRC(pending, sizeof(struct pendingData));
@@ -430,12 +434,22 @@ void rxCmdProcessor(void* parameter) {
                         quickBlink(1);
                         break;
                     case RX_CMD_XFC:
+                        // a BLE device never talks to the radio: this is a stale slot (e.g. from before an update)
+                        if (isBleTarget(((struct espXferComplete*)rxcmd->data)->src)) {
+                            Serial.println("radio XFC for a BLE device ignored");
+                            break;
+                        }
                         processXferComplete((struct espXferComplete*)rxcmd->data, true);
 #ifdef HAS_RGB_LED
                         // shortBlink(CRGB::Purple);
 #endif
                         break;
                     case RX_CMD_XTO:
+                        // BLETask decides when a BLE upload is given up; a radio timeout for one is a stale slot
+                        if (isBleTarget(((struct espXferComplete*)rxcmd->data)->src)) {
+                            Serial.println("radio XTO for a BLE device ignored");
+                            break;
+                        }
                         processXferTimeout((struct espXferComplete*)rxcmd->data, true);
                         break;
                     case RX_CMD_RSET:

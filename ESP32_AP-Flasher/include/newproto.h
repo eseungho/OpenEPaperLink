@@ -42,6 +42,9 @@ void enqueueItem(const PendingItem& item);
 bool dequeueItem(const uint8_t* targetMac);
 bool dequeueItem(const uint8_t* targetMac, const uint64_t dataVer);
 void dequeueAllItems(const uint8_t* targetMac);
+// Removes one queued item (with its .pending file) and leaves the tag's other items queued. For BLE uploads: a label
+// that can't be printed, or an image that can't be delivered, without dropping the rest.
+void dropQueueItem(const uint8_t* targetMac, const uint64_t dataVer);
 uint16_t countQueueItem(const uint8_t* targetMac);
 // A returned PendingItem stays valid for a while after it is dequeued (see freeRetiredQueueItems)
 extern PendingItem* getQueueItem(const uint8_t* targetMac);
@@ -51,3 +54,23 @@ bool queueDataAvail(struct pendingData* pending, bool local);
 uint8_t* getDataForFile(fs::File& file);
 bool loadQueueItemData(PendingItem* queueItem);
 void freeRetiredQueueItems();
+
+// BLE displays and printers: served by BLETask, never by the 802.15.4/sub-GHz radio. Data the radio holds for one only
+// times out there, and that timeout used to drop the tag's queue before BLETask had sent it.
+inline bool isBleTag(const uint8_t mac[8], const uint8_t hwType) {
+    if (mac[7] == 0x13 && mac[6] == 0x37) return true;  // ATC BLE OEPL
+    if ((hwType & 0xF0) == 0xB0) return true;           // Gicisky family
+    switch (hwType) {
+        case WOLINK_BLE_EPD_213_BWRY:
+        case WOLINK_BLE_EPD_350_BWRY:
+        case WOLINK_BLE_EPD_750_BWRY:
+        case WOLINK_BLE_UNKNOWN:
+        case NEMONIC_BLE_MIP201:
+        case NEMONIC_BLE_UNKNOWN:
+            return true;
+        default:
+            return false;
+    }
+}
+// isBleTag() for a tag in tagDB, by MAC
+bool isBleTarget(const uint8_t mac[8]);

@@ -64,13 +64,12 @@ jobs:
     needs: [determine-builds]
     if: ${{ needs.determine-builds.outputs.esp32-ap == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
+        # the two builds this fork ships (see release.yml)
         environment:
-          #- OpenEPaperLink_Mini_AP
-          #- OpenEPaperLink_AP_and_Flasher
           - ESP32_S3_16_8_YELLOW_AP
-          - OpenEPaperLink_Mini_AP_v4
-          - OpenEPaperLink_ESP32-PoE-ISO_AP
+          - BLE_ONLY_AP
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -82,10 +81,46 @@ jobs:
           cd ESP32_AP-Flasher
           pio run --environment ${{ matrix.environment }}
       - name: Build ${{ matrix.environment }} filesystem
-        if: ${{ matrix.environment != 'OpenEPaperLink_ESP32-PoE-ISO_AP' }}
         run: |
           cd ESP32_AP-Flasher
           pio run --target buildfs --environment ${{ matrix.environment }}
 
+      # Test images without publishing a release: firmware.bin for an OTA/web upload,
+      # merged-firmware.bin (writes the filesystem too, so the AP settings are reset) for USB flashing at 0x0.
+      - name: Merge ${{ matrix.environment }} full image
+        run: |
+          pip install esptool
+          cd ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin .
+          esptool.py --chip esp32-s3 merge_bin -o merged-firmware.bin --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin 0x00910000 littlefs.bin
+      - name: Upload ${{ matrix.environment }} images
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.environment }}-${{ github.sha }}
+          path: |
+            ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}/firmware.bin
+            ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}/littlefs.bin
+            ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}/partitions.bin
+            ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}/bootloader.bin
+            ESP32_AP-Flasher/.pio/build/${{ matrix.environment }}/merged-firmware.bin
+          retention-days: 14
 
-
+  web-assets:
+    name: Web assets and line endings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: data/www matches wwwroot
+        run: |
+          cd ESP32_AP-Flasher
+          python gzip_wwwfiles.py --check
+      - name: No CR line endings in firmware sources and tag types
+        run: |
+          if git grep -I -l $'\r' -- ESP32_AP-Flasher/src ESP32_AP-Flasher/include ESP32_AP-Flasher/lib ESP32_AP-Flasher/wwwroot ESP32_AP-Flasher/data/tagtypes resources/tagtypes; then
+            echo "The files above contain CR line endings; convert them to LF."
+            exit 1
+          fi

@@ -17,3 +17,7 @@ arm-tag_nrf52811-pio-ap:
 
 esp32-ap:
   - 'ESP32_AP-Flasher/**'
+  - 'resources/tagtypes/**'
+  - 'oepl-*.h'
+  - 'tag_types.h'
+  - '.github/**'

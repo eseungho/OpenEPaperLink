@@ -745,8 +745,12 @@ function normalizeVersion(version) {
     return String(version).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 }
 
-// "2.9" and "2.90" are the same release: the 2.90 release was tagged twice,
-// and the firmware built from either tag must not keep offering an update.
+// "2.9" and "2.90" are the same release: upstream tagged that release twice, and firmware built from either tag must
+// not keep offering an update. Only those two-part numeric tags are normalized: v2.3.10 is not v2.3.1.
 function sameVersion(a, b) {
-    return normalizeVersion(a) == normalizeVersion(b);
+    a = String(a);
+    b = String(b);
+    if (a == b) return true;
+    const twoPart = /^\d+\.\d+$/;
+    return twoPart.test(a) && twoPart.test(b) && normalizeVersion(a) == normalizeVersion(b);
 }

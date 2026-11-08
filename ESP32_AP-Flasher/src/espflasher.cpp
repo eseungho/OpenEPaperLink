@@ -157,9 +157,11 @@ bool downloadAndWriteBinary(String &filename, const char *url) {
         WiFiClient *stream = binaryHttp.getStreamPtr();
         uint8_t buffer[1024];
         size_t totalBytesRead = 0;
-     // timeout if we don't average at least 1k bytes/second
-        unsigned long timeOut = millis() + contentLength;
-        while(stream->connected() && totalBytesRead < contentLength) {
+     // timeout if we don't average at least 1k bytes/second (plus 5 s for a slow start)
+        unsigned long timeOut = millis() + 5000 + contentLength;
+        // A server that closes right after the last byte (HTTP/1.0 style) leaves the rest in the
+        // receive buffer, so keep reading while there is data, not only while connected.
+        while(totalBytesRead < (size_t)contentLength && (stream->connected() || stream->available())) {
             size_t bytesRead;
             size_t bytesToRead;
             if(stream->available()) {
@@ -173,12 +175,16 @@ bool downloadAndWriteBinary(String &filename, const char *url) {
                 totalBytesRead += bytesRead;
                 vTaskDelay(1 / portTICK_PERIOD_MS);
             } else {
+                if(millis() > timeOut) {
+                    wsSerial("Download time out");
+                    break;
+                }
                 vTaskDelay(10 / portTICK_PERIOD_MS);
             }
         }
         file.close();
 
-        if(!stream->connected()) {
+        if(totalBytesRead < (size_t)contentLength) {
            wsSerial("Connection dropped during transfer");
            break;
         }
@@ -203,13 +209,14 @@ bool downloadAndWriteBinary(String &filename, const char *url) {
     return Ret;
 }
 
-bool FlashC6_H2(const char *RepoUrl) {
+bool FlashC6_H2(const char *RepoUrl, bool *radioTouched) {
     String JsonFilename = "/firmware_" SHORT_CHIP_NAME ".json" ;
     bool Ret = false;
     bool bLoaderInit = false;
     bool bDownload = strlen(RepoUrl) > 0;
     int retry;
     JsonDocument jsonDoc;
+    if (radioTouched != nullptr) *radioTouched = false;
 
     LOG("%s#%d: ",__FUNCTION__,__LINE__); util::printHeap();
 
@@ -225,14 +232,30 @@ bool FlashC6_H2(const char *RepoUrl) {
         File readfile = contentFS->open(JsonFilename, "r");
         if(!readfile) {
             wsSerial("load " + JsonFilename + ": Failed to open file");
-            return true;
+            break;  // used to return true, as if the radio had been flashed
         }
         DeserializationError jsonError = deserializeJson(jsonDoc, readfile);
+        readfile.close();
 
         if(jsonError) {
             wsSerial(String("json error parsing") + JsonFilename);
             break;
         }
+
+        // Radio firmware 0x0023 and later only speaks the framed radio protocol v2 (upstream c852665), which this
+        // AP firmware doesn't have: the radio would come up "online" but never answer. Refuse it before anything
+        // is downloaded or flashed.
+        bool tooNew = false;
+        for(JsonObject obj : jsonDoc.as<JsonArray>()) {
+            const char *addressStr = obj["address"] | "";
+            const char *versionStr = obj["version"] | "";
+            if(strtoul(addressStr, NULL, 16) == 0x10000 && strtoul(versionStr, NULL, 16) >= 0x0023) {
+                wsSerial("ESP32-" SHORT_CHIP_NAME " firmware " + String(versionStr) +
+                         " needs radio protocol v2, which this AP firmware doesn't speak. Not flashed; use version 0022 or older.");
+                tooNew = true;
+            }
+        }
+        if(tooNew) break;
 
         if(!bDownload) {
            Ret = true;
@@ -274,6 +297,7 @@ bool FlashC6_H2(const char *RepoUrl) {
         };
 
         bLoaderInit = true;
+        if (radioTouched != nullptr) *radioTouched = true;  // from here on the radio is reset into its bootloader
         if(loader_port_esp32_init(&config) != ESP_LOADER_SUCCESS) {
             wsSerial("Serial initialization failed");
             break;

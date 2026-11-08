@@ -51,7 +51,7 @@ bool needRedraw(uint8_t contentMode, uint8_t wakeupReason) {
     return false;
 }
 
-void contentRunner() {
+void contentRunner(bool bleOnly) {
     if (config.runStatus == RUNSTATUS_STOP) return;
 
     time_t now;
@@ -60,11 +60,13 @@ void contentRunner() {
     WiFi.macAddress(wifimac);
     memset(&wifimac[6], 0, 2);
 
-    for (tagRecord *taginfo : tagDB) {
+    // iterate over a copy: drawNew() can take seconds and must not hold the tagDB lock
+    for (tagRecord *taginfo : tagDBSnapshot()) {
         // One pass can render (and fetch data for) many tags; report progress per tag, not per pass, and let a pending
         // reboot run its shutdown (DB save) without waiting for the whole pass.
         supervisorHeartbeat(SUPERVISED_LOOP);
         if (supervisorRebootPending()) break;
+        if (bleOnly && !isBleTag(taginfo->mac, taginfo->hwType)) continue;
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
         if (taginfo->RSSI &&
@@ -107,7 +109,7 @@ void contentRunner() {
 
 void checkVars() {
     JsonDocument cfgobj;
-    for (tagRecord *tag : tagDB) {
+    for (tagRecord *tag : tagDBSnapshot()) {
         if (tag->contentMode == 19) {
             deserializeJson(cfgobj, tag->modeConfigJson);
             const String jsonfile = cfgobj["filename"].as<String>();
@@ -1177,15 +1179,12 @@ int getImgURL(String &filename, String URL, time_t fetched, imgParam &imageParam
     http.setTimeout(5000);  // timeout in ms
     const int httpCode = http.GET();
     if (httpCode == 200) {
-        xSemaphoreTake(fsMutex, portMAX_DELAY);
-        File f = contentFS->open("/temp/temp.jpg", "w");
+        // LockedFile: don't hold fsMutex while waiting for the network
+        LockedFile f("/temp/temp.jpg", "w");
         if (f) {
             http.writeToStream(&f);
             f.close();
-            xSemaphoreGive(fsMutex);
             jpg2buffer("/temp/temp.jpg", filename, imageParams);
-        } else {
-            xSemaphoreGive(fsMutex);
         }
     } else {
         if (httpCode != 304) {
@@ -3083,7 +3082,8 @@ void prepareNFCReq(const uint8_t *dst, const char *url) {
     len = 7 + len;
     data[len] = 0xFE;
     len = 1 + len;
-    prepareDataAvail(data, len, DATATYPE_NFC_RAW_CONTENT, dst);
+    prepareDataAvail(data, len, DATATYPE_NFC_RAW_CONTENT, dst);  // copies the data
+    delete[] data;
 }
 #endif
 
@@ -3157,7 +3157,8 @@ void prepareTIME_RAW(const uint8_t *dst, time_t now) {
     data[8] = ((uint8_t*)&unix_time)[2];
     data[9] = ((uint8_t*)&unix_time)[3];
     data[10] = 1; // Design, 1 = Full DateTime 2 = Just Time Segment Style
-    prepareDataAvail(data, len + 1, DATATYPE_TIME_RAW_DATA, dst);
+    prepareDataAvail(data, len + 1, DATATYPE_TIME_RAW_DATA, dst);  // copies the data
+    delete[] data;
 }
 #endif
 

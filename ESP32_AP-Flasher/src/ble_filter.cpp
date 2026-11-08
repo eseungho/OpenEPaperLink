@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include <FS.h>
 
+#include <map>
+#include <set>
+
 #include "ble_filter.h"
 #include "ble_writer.h"
 #include "newproto.h"
@@ -365,31 +368,78 @@ bool BLE_filter_add_device(const BLE_ScanRecord& device) {
     return false;
 }
 
-bool BLE_is_image_pending(uint8_t address[8]) {
-    for (int16_t c = 0; c < tagDB.size(); c++) {
-        tagRecord* taginfo = tagDB.at(c);
-        if (taginfo->pendingCount > 0 && taginfo->version == 0 &&
-            (((taginfo->hwType & 0xF0) == 0xB0) ||
-             (taginfo->hwType == WOLINK_BLE_EPD_213_BWRY) ||
-             (taginfo->hwType == WOLINK_BLE_EPD_350_BWRY) ||
-             (taginfo->hwType == WOLINK_BLE_EPD_750_BWRY)
+// Tries per BLE device in the current round of uploads to it, so an unreachable device no longer blocks the others
+// (the idea of upstream 81861e6, 3fb25e6 and 5632ac3, for this fork's device families). BLETask only.
+static std::map<uint64_t, uint32_t> BLE_attemptCounts;
+static std::map<uint64_t, uint32_t> BLE_attemptLast;  // millis() of the last try
+#define BLE_RETRY_WAIT_MS 30000
+
+static uint64_t BLE_macToKey(const uint8_t mac[8]) {
+    uint64_t key = 0;
+    for (int i = 0; i < 8; i++) key = (key << 8) | mac[i];
+    return key;
+}
+
+// A device BLETask can upload to
+static bool BLE_isUploadFamily(const tagRecord* taginfo) {
+    if (taginfo->mac[7] == 0x13 && taginfo->mac[6] == 0x37) return true;  // ATC BLE OEPL
+    const uint8_t hwType = taginfo->hwType;
+    if ((hwType & 0xF0) == 0xB0) return true;  // Gicisky
+    if (hwType == WOLINK_BLE_EPD_213_BWRY || hwType == WOLINK_BLE_EPD_350_BWRY || hwType == WOLINK_BLE_EPD_750_BWRY) return true;
 #ifdef HAS_NEMONIC_PRINTER
-             || (taginfo->hwType == 0xE6)
+    if (hwType == NEMONIC_BLE_MIP201) return true;
 #endif
-             )) {
-            memcpy(address, taginfo->mac, 8);
-            return true;
-        }
-    }
-    for (int16_t c = 0; c < tagDB.size(); c++) {
-        tagRecord* taginfo = tagDB.at(c);
-        if (taginfo->pendingCount > 0 && taginfo->version == 0 && (taginfo->mac[7] == 0x13) && (taginfo->mac[6] == 0x37)) {
-            memcpy(address, taginfo->mac, 8);
-            Serial.printf("ATC BLE OEPL data Waiting\r\n");
-            return true;
-        }
-    }
     return false;
+}
+
+void BLE_clear_attempts(const uint8_t address[8]) {
+    BLE_attemptCounts.erase(BLE_macToKey(address));
+    BLE_attemptLast.erase(BLE_macToKey(address));
+}
+
+uint32_t BLE_get_attempts(const uint8_t address[8]) {
+    auto it = BLE_attemptCounts.find(BLE_macToKey(address));
+    return it == BLE_attemptCounts.end() ? 0 : it->second;
+}
+
+bool BLE_is_image_pending(uint8_t address[8]) {
+    // Pick the device with something queued that was tried the fewest times, and wait BLE_RETRY_WAIT_MS after a
+    // failed try: every reachable device gets its turn while an unreachable one is retried in between.
+    tagRecord* best = nullptr;
+    uint32_t bestAttempts = 0;
+    std::set<uint64_t> pending;
+    for (tagRecord* taginfo : tagDBSnapshot()) {
+        if (taginfo->pendingCount == 0 || taginfo->version != 0 || !BLE_isUploadFamily(taginfo)) continue;
+        // pendingCount goes up just before the item is queued; the image is ready once it is there
+        if (getQueueItem(taginfo->mac) == nullptr) continue;
+        const uint64_t key = BLE_macToKey(taginfo->mac);
+        pending.insert(key);
+        auto last = BLE_attemptLast.find(key);
+        if (last != BLE_attemptLast.end() && millis() - last->second < BLE_RETRY_WAIT_MS) continue;
+        auto count = BLE_attemptCounts.find(key);
+        const uint32_t attempts = count == BLE_attemptCounts.end() ? 0 : count->second;
+        if (best == nullptr || attempts < bestAttempts) {
+            best = taginfo;
+            bestAttempts = attempts;
+        }
+    }
+    // forget devices that have nothing queued anymore (delivered, cleared or given up meanwhile)
+    for (auto it = BLE_attemptCounts.begin(); it != BLE_attemptCounts.end();) {
+        if (pending.count(it->first) == 0) {
+            BLE_attemptLast.erase(it->first);
+            it = BLE_attemptCounts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (best == nullptr) return false;
+
+    memcpy(address, best->mac, 8);
+    const uint64_t key = BLE_macToKey(best->mac);
+    BLE_attemptCounts[key]++;  // count this try, so the next round prefers the others
+    BLE_attemptLast[key] = millis();
+    if (best->mac[7] == 0x13 && best->mac[6] == 0x37) Serial.printf("ATC BLE OEPL data Waiting\r\n");
+    return true;
 }
 
 uint8_t swapBits(uint8_t num) {
@@ -402,22 +452,16 @@ uint8_t swapBits(uint8_t num) {
 
 uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
     uint32_t t = millis();
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
-        prepareCancelPending(address);
-        Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
+        // replaced or cleared since BLETask picked it: the next round takes what is queued now
+        Serial.printf("BLE: queued item for %02X%02X%02X%02X%02X%02X%02X%02X is gone\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("No current file. " + String(queueItem->filename) + " Canceling request\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        Serial.println("Reading file " + String(queueItem->filename) + " in  " + String(millis() - t) + "ms");
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        // missing file or no memory: counts as a failed try, so a lasting problem ends with the give-up
+        Serial.print("No data for " + String(queueItem->filename) + "\r\n");
+        return 0;
     }
 
     uint16_t giciType = (address[7] << 8) | address[6];  // here we "extract" the display info again
@@ -690,22 +734,16 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
 #define WOLINK75_INVERT_BW         1
 #define WOLINK75_INVERT_COLOR      0
 uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
-        prepareCancelPending(address);
-        Serial.printf("Wolink pack: missing taginfo %02X%02X%02X%02X%02X%02X\r\n",
+        // replaced or cleared since BLETask picked it: the next round takes what is queued now
+        Serial.printf("Wolink pack: queued item for %02X%02X%02X%02X%02X%02X is gone\r\n",
                       address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("Wolink pack: no file " + String(queueItem->filename) + ", canceling\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        Serial.print("Wolink pack: can't load " + String(queueItem->filename) + "\r\n");
+        return 0;
     }
 
     tagRecord* taginfo = tagRecord::findByMAC(address);
@@ -725,8 +763,8 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             height = 480;
             break;
         default:
-            Serial.printf("Wolink pack: unsupported hwType 0x%02X, canceling\r\n", hwType);
-            prepareCancelPending(address);
+            Serial.printf("Wolink pack: unsupported hwType 0x%02X, dropping the item\r\n", hwType);
+            dropQueueItem(address, BLE_curr_dataVer);
             return 0;
     }
     const uint32_t byte_per_line = (uint32_t)height / 8;
@@ -738,11 +776,22 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                       (unsigned)max_len, (unsigned)out_len);
         return 0;
     }
-    if (queueItem->len < 2 * plane_size) {
-        Serial.printf("Wolink pack: source too small (%u < %u)\r\n",
-                      (unsigned)queueItem->len, (unsigned)(2 * plane_size));
+    const uint8_t dataType = queueItem->pendingdata.availdatainfo.dataType;
+    if (dataType != DATATYPE_IMG_RAW_1BPP && dataType != DATATYPE_IMG_RAW_2BPP) {
+        // a command (reboot, LED, ...) or a compressed image: nothing a Wolink tag can show
+        Serial.printf("Wolink pack: unsupported data type 0x%02X, dropping the item\r\n", dataType);
+        dropQueueItem(address, BLE_curr_dataVer);
         return 0;
     }
+    // makeimage writes the colour plane only when the image has red or yellow pixels: a black and white
+    // image is a single plane and has colour bit 0 everywhere.
+    if (queueItem->len < plane_size) {
+        Serial.printf("Wolink pack: source too small (%u < %u), dropping the item\r\n",
+                      (unsigned)queueItem->len, (unsigned)plane_size);
+        dropQueueItem(address, BLE_curr_dataVer);
+        return 0;
+    }
+    const bool hasColor = queueItem->len >= 2 * plane_size;
 
     memset(buffer, 0, out_len);
 
@@ -762,7 +811,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                 uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
                 uint8_t mask = 0x80 >> (y % 8);
                 uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
-                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
+                uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;
                 uint8_t bw    = WOLINK75_INVERT_BW    ? (p1 ? 0 : 1) : p1;
                 uint8_t color = WOLINK75_INVERT_COLOR ? (p2 ? 0 : 1) : p2;
                 int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
@@ -789,7 +838,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
                 uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
                 uint8_t mask = 0x80 >> (y % 8);
                 uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;
-                uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;
+                uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;
                 if (WOLINK75_SWAP_RY && p2) p1 ^= 1;                 // red<->yellow
                 uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
                 int phy_y = WOLINK75_YFLIP ? (height - 1 - y) : y;
@@ -815,7 +864,7 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
             uint32_t off = (uint32_t)x * byte_per_line + (y / 8);
             uint8_t mask = 0x80 >> (y % 8);
             uint8_t p1 = (queueItem->data[off] & mask) ? 1 : 0;                 // B/W plane
-            uint8_t p2 = (queueItem->data[off + plane_size] & mask) ? 1 : 0;    // color plane
+            uint8_t p2 = (hasColor && (queueItem->data[off + plane_size] & mask)) ? 1 : 0;    // color plane
             // black (1,0)->00, white (0,0)->01, red (0,1)->11, yellow (1,1)->10.
             uint8_t color = ((uint8_t)(p2 & 1) << 1) | (uint8_t)(p1 ? 0 : 1);
             int phy_y = (height - 1) - y;
@@ -829,26 +878,20 @@ uint32_t pack_wolink_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len
 
 uint32_t get_ATC_BLE_OEPL_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len, uint8_t* dataType, uint8_t* dataTypeArgument, uint16_t* nextCheckIn) {
     uint32_t t = millis();
-    PendingItem* queueItem = getQueueItem(address, 0);
+    PendingItem* queueItem = getQueueItem(address, BLE_curr_dataVer);
     if (queueItem == nullptr) {
-        prepareCancelPending(address);
-        Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
+        // replaced or cleared since BLETask picked it: the next round takes what is queued now
+        Serial.printf("BLE: queued item for %02X%02X%02X%02X%02X%02X%02X%02X is gone\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("No current file. " + String(queueItem->filename) + " Canceling request\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        Serial.println("Reading file " + String(queueItem->filename) + " in  " + String(millis() - t) + "ms");
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        // missing file or no memory: counts as a failed try, so a lasting problem ends with the give-up
+        Serial.print("No data for " + String(queueItem->filename) + "\r\n");
+        return 0;
     }
     if (queueItem->len > max_len) {
-        Serial.print("The upload is too big better cencel it\r\n");
-        prepareCancelPending(address);
+        Serial.print("The upload is too big, dropping it\r\n");
+        dropQueueItem(address, BLE_curr_dataVer);
         return 0;
     }
     *dataType = queueItem->pendingdata.availdatainfo.dataType;

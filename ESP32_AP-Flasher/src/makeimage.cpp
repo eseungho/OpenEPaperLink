@@ -313,7 +313,7 @@ bool initializeCompressor(Miniz::tdefl_compressor *comp, int flags) {
     return Miniz::tdefl_initOEPL(comp, NULL, NULL, flags) == Miniz::TDEFL_STATUS_OKAY;
 }
 
-size_t compressAndWrite(Miniz::tdefl_compressor *comp, const void *inbuf, size_t inbytes, void *zlibbuf, size_t outsize, size_t totalbytes, File &f_out, Miniz::tdefl_flush flush) {
+size_t compressAndWrite(Miniz::tdefl_compressor *comp, const void *inbuf, size_t inbytes, void *zlibbuf, size_t outsize, size_t totalbytes, LockedFile &f_out, Miniz::tdefl_flush flush) {
     size_t inbytes_compressed = inbytes;
     size_t outbytes_compressed = outsize;
 
@@ -325,7 +325,7 @@ size_t compressAndWrite(Miniz::tdefl_compressor *comp, const void *inbuf, size_t
     return outbytes_compressed;
 }
 
-void rewriteHeader(File &f_out) {
+void rewriteHeader(LockedFile &f_out) {
     // https://www.rfc-editor.org/rfc/rfc1950
     const uint8_t cmf = 0x48;  // 4096
     // const uint8_t cmf = 0x58; // 8192
@@ -422,6 +422,7 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
     extern uint8_t YellowSense;
     if (fileout == "direct") {
         if (tftOverride == false) {
+            TFTLock lock;
             TFT_eSprite spr2 = TFT_eSprite(&tft2);
 #ifdef ST7735_NANO_TLSR
             tft2.setRotation(1);
@@ -454,8 +455,8 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
     }
 #endif
 
-    xSemaphoreTake(fsMutex, portMAX_DELAY);
-    fs::File f_out = contentFS->open(fileout, "w");
+    // fsMutex is taken per write, not during the (slow) conversion and compression
+    LockedFile f_out(fileout, "w");
 
     switch (imageParams.bpp) {
         case 1:
@@ -473,7 +474,6 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
                 Serial.println("Failed to allocate buffer");
                 util::printLargestFreeBlock();
                 f_out.close();
-                xSemaphoreGive(fsMutex);
                 return;
             }
             spr2color(spr, imageParams, buffer, buffer_size, false);
@@ -490,9 +490,18 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
 
                 // 768 = compression level 9, 1500 = unofficial level 10
                 if (comp == NULL || zlibbuf == NULL || totalbytes == 0 || !initializeCompressor(comp, Miniz::TDEFL_WRITE_ZLIB_HEADER | 1500)) {
-                    Serial.println("Failed to initialize compressor or allocate memory for zlib");
+                    Serial.println("Failed to initialize compressor or allocate memory for zlib, falling back to raw");
                     if (zlibbuf != NULL) free(zlibbuf);
                     if (comp != NULL) free(comp);
+                    imageParams.zlib = 0;
+                    imageParams.g5 = 0;
+                    f_out.seek(0);
+                    f_out.write(buffer, buffer_size);
+                    if (imageParams.hasRed && imageParams.bpp > 1) {
+                        spr2color(spr, imageParams, buffer, buffer_size, true);
+                        f_out.write(buffer, buffer_size);
+                    }
+                    free(buffer);
                     break;
                 }
 
@@ -525,7 +534,6 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
                         Serial.println("Failed to allocate larger buffer for 2bpp G5");
                         free(buffer);
                         f_out.close();
-                        xSemaphoreGive(fsMutex);
                         return;
                     }
                     buffer = newbuffer;
@@ -591,7 +599,6 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
                 Serial.println("Failed to allocate buffer");
                 util::printLargestFreeBlock();
                 f_out.close();
-                xSemaphoreGive(fsMutex);
                 return;
             }
             spr2color(spr, imageParams, buffer, buffer_size, false);
@@ -607,6 +614,5 @@ void spr2buffer(TFT_eSprite &spr, String &fileout, imgParam &imageParams) {
     }
 
     f_out.close();
-    xSemaphoreGive(fsMutex);
     Serial.println("finished writing buffer " + String(millis() - t) + "ms");
 }

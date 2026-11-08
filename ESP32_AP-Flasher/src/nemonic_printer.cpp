@@ -5,6 +5,8 @@
 
 #include <NimBLEDevice.h>
 
+#include <memory>
+
 #include "ble_writer.h"
 #include "nemonic_printer.h"
 #include "nemonic_raster.h"
@@ -110,44 +112,47 @@ static NemonicOpts nemonic_parse_opts(tagRecord* tag) {
     return o;
 }
 
-bool nemonic_upload(uint8_t address[8]) {
+NemonicResult nemonic_upload(uint8_t address[8]) {
     // 1) Fetch the rendered 1bpp raster from the pending queue.
-    PendingItem* item = getQueueItem(address, 0);
+    PendingItem* item = getQueueItem(address, BLE_curr_dataVer);
     if (item == nullptr) {
-        Serial.println("Nemonic: no queue item, canceling");
-        prepareCancelPending(address);
-        return false;
+        // replaced or cleared since BLETask picked it: the next round takes what is queued now
+        Serial.println("Nemonic: the queued label is gone");
+        return NEMONIC_RETRY;
     }
-    if (item->data == nullptr) {
-        fs::File f = contentFS->open(item->filename);
-        if (!f) {
-            Serial.printf("Nemonic: missing file %s, canceling\r\n", item->filename);
-            prepareCancelPending(address);
-            return false;
-        }
-        item->data = getDataForFile(f);
-        f.close();
+    if (!loadQueueItemData(item)) {
+        // missing file or no memory: retried, and given up (only this label) after the last try
+        Serial.printf("Nemonic: can't load %s\r\n", item->filename);
+        return NEMONIC_RETRY;
     }
-    if (item->data == nullptr || item->len == 0) {
-        Serial.println("Nemonic: empty raster, canceling");
-        prepareCancelPending(address);
-        return false;
+    if (item->len == 0) {
+        Serial.println("Nemonic: empty raster");
+        return NEMONIC_DROP;
     }
+    // Print from a private copy: other tasks can replace or dequeue the queue item meanwhile, and a long label
+    // with slow ACKs can take longer than a dequeued item is kept before it is freed.
+    const uint32_t rasterLen = item->len;
+    std::unique_ptr<uint8_t, void (*)(void*)> rasterCopy(
+        (uint8_t*)heap_caps_malloc(rasterLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), free);
+    if (!rasterCopy) {
+        Serial.println("Nemonic: no memory for the raster copy, retrying later");
+        return NEMONIC_RETRY;
+    }
+    memcpy(rasterCopy.get(), item->data, rasterLen);
+    const uint8_t* raster = rasterCopy.get();
 
     // 2) Derive height; trim trailing white rows; sanity check.
-    if (item->len % NEMONIC_WIDTH_BYTES != 0) {
+    if (rasterLen % NEMONIC_WIDTH_BYTES != 0) {
         Serial.printf("Nemonic: raster size %u not a multiple of %u (width %u dots)\r\n",
-                      (unsigned)item->len, NEMONIC_WIDTH_BYTES, NEMONIC_WIDTH_DOTS);
-        prepareCancelPending(address);
-        return false;
+                      (unsigned)rasterLen, NEMONIC_WIDTH_BYTES, NEMONIC_WIDTH_DOTS);
+        return NEMONIC_DROP;
     }
-    uint16_t fullHeight = (uint16_t)(item->len / NEMONIC_WIDTH_BYTES);
+    uint16_t fullHeight = (uint16_t)(rasterLen / NEMONIC_WIDTH_BYTES);
     if (fullHeight == 0 || fullHeight > NEMONIC_MAX_HEIGHT) {
         Serial.printf("Nemonic: invalid height %u (max %u)\r\n", fullHeight, NEMONIC_MAX_HEIGHT);
-        prepareCancelPending(address);
-        return false;
+        return NEMONIC_DROP;
     }
-    uint16_t height = nemonicTrimTrailingWhite(item->data, NEMONIC_WIDTH_BYTES, fullHeight);
+    uint16_t height = nemonicTrimTrailingWhite(raster, NEMONIC_WIDTH_BYTES, fullHeight);
     uint32_t rasterBytes = (uint32_t)NEMONIC_WIDTH_BYTES * height;
     uint32_t totalPayload = NEMONIC_FIRST_PREPEND + rasterBytes;
     uint8_t  totalFrames  = nemonicSplitCount(totalPayload);
@@ -167,8 +172,7 @@ bool nemonic_upload(uint8_t address[8]) {
     if (frameBuf == nullptr) frameBuf = (uint8_t*)malloc(NEMONIC_FRAME_HEADER + NEMONIC_SPLIT_MAX);
     if (frameBuf == nullptr) {
         Serial.println("Nemonic: frameBuf alloc failed");
-        prepareCancelPending(address);
-        return false;
+        return NEMONIC_RETRY;
     }
 
     // 5) BLE connect. tag_db stores the address LSB-first; BLE_tagAddress() converts it, this is just for the log.
@@ -180,7 +184,7 @@ bool nemonic_upload(uint8_t address[8]) {
     if (client == nullptr || !client->connect(BLE_tagAddress(address), true)) {
         Serial.println("Nemonic: connect() returned false");
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     uint32_t t0 = millis();
     while (!BLE_connected && millis() - t0 < 5000) vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -188,7 +192,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: connection did not settle");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     // NimBLE negotiates up to 255 on connect. Chunks longer than MTU-3 would become long writes, which NimBLE
     // silently truncates if the printer rejects them, so size them from the MTU.
@@ -197,7 +201,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.printf("Nemonic: MTU %u too small\r\n", mtu);
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     nemonic_chunk = (mtu - 3) < NEMONIC_BLE_CHUNK ? (mtu - 3) : NEMONIC_BLE_CHUNK;
 
@@ -206,7 +210,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: service not found");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     NimBLERemoteCharacteristic* writeChar  = svc->getCharacteristic(nemonicWriteUUID);
     NimBLERemoteCharacteristic* notifyChar = svc->getCharacteristic(nemonicNotifyUUID);
@@ -214,14 +218,14 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.println("Nemonic: characteristic discovery failed");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     nemonic_ack_ready = false;
     if (!notifyChar->canNotify()) {
         Serial.println("Nemonic: notify characteristic does not support notify");
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     }
     if (!notifyChar->subscribe(true, nemonicNotifyCb)) {
         // registerForNotify() ignored a failed CCCD write too; notifications may still arrive.
@@ -232,7 +236,7 @@ bool nemonic_upload(uint8_t address[8]) {
         Serial.printf("Nemonic FAIL: %s\r\n", why);
         client->disconnect();
         free(frameBuf);
-        return false;
+        return NEMONIC_RETRY;
     };
 
     // 6) INIT
@@ -249,8 +253,7 @@ bool nemonic_upload(uint8_t address[8]) {
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
-    // 8) Split frames. Stream raster directly from item->data; build each
-    //    frame in frameBuf and ship it.
+    // 8) Split frames. Stream the raster copy; build each frame in frameBuf and ship it.
     uint32_t cursor = 0;
     for (uint8_t idx = 0; idx < totalFrames; idx++) {
         uint32_t remaining = totalPayload - cursor;
@@ -263,10 +266,10 @@ bool nemonic_upload(uint8_t address[8]) {
             payload[2] = (uint8_t)(height & 0xFF);
             payload[3] = (uint8_t)((height >> 8) & 0xFF);
             uint32_t rasterChunk = thisLen - NEMONIC_FIRST_PREPEND;
-            memcpy(payload + NEMONIC_FIRST_PREPEND, item->data, rasterChunk);
+            memcpy(payload + NEMONIC_FIRST_PREPEND, raster, rasterChunk);
         } else {
             uint32_t rasterOffset = cursor - NEMONIC_FIRST_PREPEND;
-            memcpy(payload, item->data + rasterOffset, thisLen);
+            memcpy(payload, raster + rasterOffset, thisLen);
         }
         cursor += thisLen;
 
@@ -292,6 +295,9 @@ bool nemonic_upload(uint8_t address[8]) {
     // 9) PRINT (cut or no-cut), or skip if debug noprint set.
     if (!opts.noprint) {
         uint8_t printCmd[2] = { 0x1B, (uint8_t)(opts.cut ? 0x50 : 0x51) };
+        // A failed write never reached the controller (NimBLE frees the packet and returns an error), so the printer
+        // can't have it: retry, the next INIT discards the frames. Once the write succeeds the label may print, so
+        // from then on it counts as delivered and is never sent again.
         if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) return fail("PRINT write failed");
         vTaskDelay(50 / portTICK_PERIOD_MS);
     } else {
@@ -301,7 +307,7 @@ bool nemonic_upload(uint8_t address[8]) {
     // 10) Done.
     client->disconnect();
     free(frameBuf);
-    return true;
+    return NEMONIC_DELIVERED;
 }
 
 #endif

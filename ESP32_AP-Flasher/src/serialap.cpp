@@ -50,7 +50,11 @@ struct espSetChannelPower curChannel = {0, 11, 10};
 volatile uint32_t lastAPActivity = 0;
 struct APInfoS apInfo;
 
-volatile ApSerialState gSerialTaskState;
+// Set while rxSerialTask exists; the task clears it as its last act
+static TaskHandle_t volatile apReaderTask = nullptr;
+static volatile bool apReaderStop = false;
+// Set by the debug monitor (rxSerialTask2), handled by APTask: the only task that resets the radio at runtime
+static volatile bool modemResetRequested = false;
 
 struct rxCmd {
     uint8_t* data;
@@ -98,9 +102,9 @@ void txEnd() {
         xSemaphoreGive(txActive);
     }
 }
-bool waitCmdReply() {
+bool waitCmdReply(uint32_t timeoutMs = 200) {
     uint32_t val = millis();
-    while (millis() < val + 200) {
+    while (millis() - val < timeoutMs) {
         switch (cmdReplyValue) {
             case CMD_REPLY_WAIT:
                 break;
@@ -168,18 +172,7 @@ void setAPstate(bool isOnline, uint8_t state) {
 #endif
 #ifdef FLASHER_DEBUG_SHARED
     // Flasher shares port with AP comms
-    if (state == AP_STATE_FLASHING) {
-        LOG("Shared COM port, gSerialTaskState %d\n", gSerialTaskState);
-        gSerialTaskState = SERIAL_STATE_STOP;
-        for (int i = 0; i < 100; i++) {
-            vTaskDelay(1 / portTICK_RATE_MS);
-            if (gSerialTaskState == SERIAL_STATE_STOPPED) {
-                gSerialTaskState = SERIAL_STATE_NONE;
-                break;
-            }
-        }
-        LOG("gSerialTaskState %d\n", gSerialTaskState);
-    }
+    if (state == AP_STATE_FLASHING) stopApReader();
 #endif
     wsSendSysteminfo();
 }
@@ -216,7 +209,11 @@ uint16_t sendBlock(const void* data, const uint16_t len) {
     for (uint8_t attempt = 0; attempt < 1; attempt++) {
         cmdReplyValue = CMD_REPLY_WAIT;
         AP_SERIAL_PORT.print(">D>");
-        if (waitCmdReply()) goto blksend;
+        // The radio reads no serial data while it sends a block burst (up to about 200 ms), so wait
+        // longer than one burst. Giving up too early left the radio waiting for block data that
+        // never came, and it then took the next commands as data (6 % of block hand-overs in an
+        // hour with 8 tags, docs/design/radio-chain-results.md).
+        if (waitCmdReply(500)) goto blksend;
         Serial.printf("block send failed in try %d\r\n", attempt);
     }
     Serial.print("Failed sending block...\r\n");
@@ -279,6 +276,9 @@ blksend:
 
 bool sendDataAvail(struct pendingData* pending) {
     if (apInfo.state == AP_STATE_NORADIO) return true;
+    // BLETask serves BLE displays and printers. The radio never hears them: it would time the slot out after
+    // attemptsLeft minutes and the XTO would drop the tag's queue, also in the middle of a BLE upload.
+    if (isBleTarget(pending->targetMac)) return true;
     if (!apInfo.isOnline) return false;
     if (!txStart()) return false;
     addCRC(pending, sizeof(struct pendingData));
@@ -301,6 +301,7 @@ bool sendDataAvail(struct pendingData* pending) {
 }
 bool sendCancelPending(struct pendingData* pending) {
     if (apInfo.state == AP_STATE_NORADIO) return true;
+    if (isBleTarget(pending->targetMac)) return true;  // nothing in the radio to cancel (see sendDataAvail)
     if (!apInfo.isOnline) return false;
     if (!txStart()) return false;
     addCRC(pending, sizeof(struct pendingData));
@@ -430,17 +431,27 @@ void rxCmdProcessor(void* parameter) {
                         quickBlink(1);
                         break;
                     case RX_CMD_XFC:
+                        // a BLE device never talks to the radio: this is a stale slot (e.g. from before an update)
+                        if (isBleTarget(((struct espXferComplete*)rxcmd->data)->src)) {
+                            Serial.println("radio XFC for a BLE device ignored");
+                            break;
+                        }
                         processXferComplete((struct espXferComplete*)rxcmd->data, true);
 #ifdef HAS_RGB_LED
                         // shortBlink(CRGB::Purple);
 #endif
                         break;
                     case RX_CMD_XTO:
+                        // BLETask decides when a BLE upload is given up; a radio timeout for one is a stale slot
+                        if (isBleTarget(((struct espXferComplete*)rxcmd->data)->src)) {
+                            Serial.println("radio XTO for a BLE device ignored");
+                            break;
+                        }
                         processXferTimeout((struct espXferComplete*)rxcmd->data, true);
                         break;
                     case RX_CMD_RSET:
                         Serial.println("AP did reset, resending pending\r\n");
-                        refreshAllPending();
+                        refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                         sendChannelPower(&curChannel);
                         break;
                     case RX_CMD_TRD:
@@ -463,12 +474,37 @@ void rxSerialTask(void* parameter) {
     static uint8_t RXState = ZBS_RX_WAIT_HEADER;
     static char lastchar = 0;
     static uint8_t charindex = 0;
+    static uint32_t lastByteMs = 0;
 
-    gSerialTaskState = SERIAL_STATE_RUNNING;
+    // States that own the calloc'ed packetp until they hand it to addRXQueue()
+    auto ownsPacket = [](uint8_t state) {
+        return state == ZBS_RX_BLOCK_REQUEST || state == ZBS_RX_WAIT_XFERCOMPLETE || state == ZBS_RX_WAIT_XFERTIMEOUT ||
+               state == ZBS_RX_WAIT_DATA_REQ || state == ZBS_RX_WAIT_TAG_RETURN_DATA;
+    };
+
+    // a reader that was stopped in the middle of a message left its parser state behind
+    if (ownsPacket(RXState)) free(packetp);
+    packetp = nullptr;
+    RXState = ZBS_RX_WAIT_HEADER;
+    pktindex = 0;
+    charindex = 0;
+    lastchar = 0;
+    memset(cmdbuffer, 0, sizeof(cmdbuffer));
+
     LOG("rxSerialTask starting\n");
-    while (gSerialTaskState == SERIAL_STATE_RUNNING) {
+    while (!apReaderStop) {
+        // A message whose bytes stopped arriving (lost bytes) must not keep the parser in a payload
+        // state, where it would swallow the next messages as payload.
+        if (RXState != ZBS_RX_WAIT_HEADER && !AP_SERIAL_PORT.available() && millis() - lastByteMs > 100) {
+            if (ownsPacket(RXState)) free(packetp);
+            packetp = nullptr;
+            RXState = ZBS_RX_WAIT_HEADER;
+            Serial.print("AP serial: incomplete message dropped\r\n");
+        }
         while (AP_SERIAL_PORT.available()) {
             lastchar = AP_SERIAL_PORT.read();
+            lastByteMs = millis();
+            if (ownsPacket(RXState) && packetp == nullptr) RXState = ZBS_RX_WAIT_HEADER;  // calloc failed
             switch (RXState) {
                 case ZBS_RX_WAIT_HEADER:
 
@@ -608,6 +644,15 @@ void rxSerialTask(void* parameter) {
                 case ZBS_RX_WAIT_TAG_RETURN_DATA: {
                     packetp[pktindex] = lastchar;
                     pktindex++;
+                    // byte 9 is the length of the tag data; an impossible value (corrupted or lost
+                    // bytes) would let pktindex run past the buffer and wrap around
+                    if (pktindex == 10 && packetp[9] > sizeof(struct tagReturnData)) {
+                        free(packetp);
+                        packetp = nullptr;
+                        RXState = ZBS_RX_WAIT_HEADER;
+                        Serial.print("AP serial: TRD with invalid length dropped\r\n");
+                        break;
+                    }
                     if ((pktindex > 10) && (pktindex >= (packetp[9] + 10))) {
                         addRXQueue(packetp, pktindex, RX_CMD_TRD);
                         RXState = ZBS_RX_WAIT_HEADER;
@@ -618,7 +663,9 @@ void rxSerialTask(void* parameter) {
                     charindex++;
                     if (charindex == 4) {
                         charindex = 0;
-                        apInfo.version = (uint16_t)strtoul(cmdbuffer, NULL, 16);
+                        // cmdbuffer holds exactly 4 characters and no terminator
+                        const char ver[5] = {cmdbuffer[0], cmdbuffer[1], cmdbuffer[2], cmdbuffer[3], 0};
+                        apInfo.version = (uint16_t)strtoul(ver, NULL, 16);
                         RXState = ZBS_RX_WAIT_HEADER;
                     }
                     break;
@@ -697,9 +744,60 @@ void rxSerialTask(void* parameter) {
     }  // end of while(1)
 
     AP_SERIAL_PORT.end();
-    gSerialTaskState = SERIAL_STATE_STOPPED;
     LOG("rxSerialTask stopped\n");
+    apReaderTask = nullptr;
     vTaskDelete(NULL);
+}
+
+bool apReaderRunning() { return apReaderTask != nullptr; }
+
+// Opens the port and starts the reader, unless it runs already: opening the port again under a running reader
+// frees its receive buffer, and a second reader shares the parser state with it (heap corruption, ghost tags).
+// From upstream 1ba8b87 (#586).
+bool startApReader() {
+    if (apReaderTask) return true;
+#ifdef HAS_ELECROW_ADV_2_8
+    // Set GPIO45 low to connect the wireless interface to the multiplexed pins
+    pinMode(45, OUTPUT);
+    digitalWrite(45, LOW);
+#endif
+
+    // The default 256-byte buffer holds only 1.3 ms of data at 2 Mbaud, while rxSerialTask
+    // polls every millisecond and runs below the WiFi tasks. 4 KB gives about 20 ms.
+    // Has to be set before begin(); a port that is already open keeps its buffer.
+    AP_SERIAL_PORT.setRxBufferSize(4096);
+#if (AP_PROCESS_PORT == FLASHER_AP_PORT)
+    AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
+#elif defined(HAS_EXT_FLASHER)
+#if (AP_PROCESS_PORT == FLASHER_EXT_PORT)
+    AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_EXT_RXD, FLASHER_EXT_TXD);
+#elif (AP_PROCESS_PORT == FLASHER_ALTRADIO_PORT)
+    AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
+#endif
+#endif
+    apReaderStop = false;
+    // the handle is set before the task can run, so it never sees itself unregistered
+    // 3072 bytes of stack (upstream 4ac63fc): 1750 left too little on the Yellow AP
+    if (xTaskCreate(rxSerialTask, "rxSerialTask", 3072, NULL, 11, (TaskHandle_t*)&apReaderTask) != pdPASS) {
+        apReaderTask = nullptr;
+        AP_SERIAL_PORT.end();
+        return false;
+    }
+    return true;
+}
+
+// Stops the reader and closes the port. False if it did not stop within a second; it then still
+// counts as running, so startApReader() won't start a second one.
+bool stopApReader() {
+    if (!apReaderTask) return true;
+    apReaderStop = true;
+    const uint32_t start = millis();
+    while (apReaderTask && millis() - start < 1000) vTaskDelay(1);
+    if (apReaderTask) {
+        LOG("rxSerialTask did not stop\n");
+        return false;
+    }
+    return true;
 }
 
 #if defined(FLASHER_DEBUG_RXD) && !defined(FLASHER_DEBUG_SHARED)
@@ -731,31 +829,10 @@ void rxSerialTask2(void* parameter) {
             if (lastchar == '\n' || lastchar == '\r') {
                 if (strncmp(rxStr, "receive buffer full, drop the current frame", 43) == 0 && millisDiff(modemResetHoldoff) > 20000) {
                     modemResetHoldoff = millis();
-                    vTaskDelay(100 / portTICK_PERIOD_MS);
-                    const uint8_t prevRunStatus = config.runStatus;
-                    config.runStatus = RUNSTATUS_STOP;
-                    Serial.println("IEEE802.15.4 modem stuck case detected, resetting...");
-                    APTagReset();
-                    vTaskDelay(1000 / portTICK_PERIOD_MS);
-                    Serial.println("bringing AP online again");
-                    const bool resetOk = bringAPOnline();
-                    // A C6 firmware update may have started meanwhile (bringAPOnline() then fails on purpose): leave
-                    // its FLASHING state and its runStatus alone, or APTask would reset the C6 in the middle of the
-                    // flash.
-                    const bool flashing = apInfo.state == AP_STATE_FLASHING;
-                    if (resetOk) {
-                        Serial.println("Finished!");
-                    } else {
-                        // bringAPOnline() leaves the state at OFFLINE, which APTask's recovery loop ignores (it only
-                        // retries ONLINE/FAILED). Together with runStatus staying STOP, a single failed reset used to
-                        // leave the AP dead until the next reboot. Hand the radio over to that recovery loop instead.
-                        if (!flashing) setAPstate(false, AP_STATE_FAILED);
-                        Serial.println("Failed!");
-                    }
-                    // Only undo our own STOP: an OTA or shutdown may have set STOP since, and boot code may already
-                    // have moved INIT on to RUN.
-                    if (!flashing && config.runStatus == RUNSTATUS_STOP) config.runStatus = prevRunStatus;
-                    logLine(String("IEEE802.15.4 modem reset ") + (resetOk ? "ok" : "failed"));
+                    Serial.println("IEEE802.15.4 modem stuck case detected");
+                    // APTask does the reset: resetting here, beside APTask's own recovery, started a second
+                    // rxSerialTask (upstream 1ba8b87)
+                    modemResetRequested = true;
                 }
                 rxStrCount = 0;
                 memset(rxStr, 0, sizeof(rxStr));
@@ -837,27 +914,8 @@ bool bringAPOnline(uint8_t newState) {
     if (apInfo.state == AP_STATE_NORADIO) return true;
     if (apInfo.state == AP_STATE_FLASHING) return false;
 
-    if (gSerialTaskState != SERIAL_STATE_INITIALIZED) {
-#ifdef HAS_ELECROW_ADV_2_8
-        // Set GPIO45 low to connect the wireless interface to the multiplexed pins
-        pinMode(45, OUTPUT);
-        digitalWrite(45, LOW);
-#endif
-
-#if (AP_PROCESS_PORT == FLASHER_AP_PORT)
-        AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
-#elif defined(HAS_EXT_FLASHER)
-#if (AP_PROCESS_PORT == FLASHER_EXT_PORT)
-        AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_EXT_RXD, FLASHER_EXT_TXD);
-#elif (AP_PROCESS_PORT == FLASHER_ALTRADIO_PORT)
-        AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
-#endif
-#endif
-        gSerialTaskState = SERIAL_STATE_INITIALIZED;
-    }
-    if (gSerialTaskState != SERIAL_STATE_RUNNING) {
-        gSerialTaskState = SERIAL_STATE_STARTING;
-        xTaskCreate(rxSerialTask, "rxSerialTask", 1750, NULL, 11, NULL);
+    if (!apReaderRunning()) {
+        if (!startApReader()) return false;
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
     setAPstate(false, AP_STATE_OFFLINE);
@@ -1004,7 +1062,7 @@ void APTask(void* parameter) {
         }
 #endif
 
-        refreshAllPending();
+        refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
     } else {
 #ifndef FLASH_TIMEOUT
 #define FLASH_TIMEOUT 30
@@ -1038,7 +1096,7 @@ void APTask(void* parameter) {
                         segmentedShowIp();
                         showAPSegmentedInfo(apInfo.mac, true);
                     }
-                    refreshAllPending();
+                    refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                 } else {
                     Serial.printf("Failed to bring up the AP after successful flashing... That's not supposed to happen!\r\n");
                     Serial.printf("This generally means that the flasher connections (MISO/MOSI/CLK/RESET/CS) are okay,\r\n");
@@ -1094,6 +1152,31 @@ void APTask(void* parameter) {
     uint8_t attempts = 0;
     while (1) {
         supervisorHeartbeat(SUPERVISED_AP);
+        if (modemResetRequested) {
+            modemResetRequested = false;
+            // not while the port is in other hands (flashing), that brings the radio back itself
+            if (apInfo.state == AP_STATE_ONLINE || apInfo.state == AP_STATE_FAILED) {
+                const uint8_t prevRunStatus = config.runStatus;
+                config.runStatus = RUNSTATUS_STOP;
+                Serial.println("IEEE802.15.4 modem stuck, resetting...");
+                APTagReset();
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                const bool resetOk = bringAPOnline();
+                // A C6 firmware update may have started meanwhile (bringAPOnline() then fails on purpose): leave its
+                // FLASHING state and its runStatus alone.
+                const bool flashing = apInfo.state == AP_STATE_FLASHING;
+                if (resetOk) {
+                    attempts = 0;
+                } else if (!flashing) {
+                    // the ping recovery below tries again later (bringAPOnline() leaves OFFLINE, which it ignores)
+                    setAPstate(false, AP_STATE_FAILED);
+                    lastAPActivity = millis();
+                }
+                // Only undo our own STOP: an OTA or shutdown may have set STOP since.
+                if (!flashing && config.runStatus == RUNSTATUS_STOP) config.runStatus = prevRunStatus;
+                logLine(String("IEEE802.15.4 modem reset ") + (resetOk ? "ok" : "failed"));
+            }
+        }
         if (((apInfo.state == AP_STATE_ONLINE) || (apInfo.state == AP_STATE_FAILED)) && (millis() - lastAPActivity > AP_ACTIVITY_MAX_INTERVAL)) {
             bool reply = sendPing();
             if (!reply) {
@@ -1107,15 +1190,19 @@ void APTask(void* parameter) {
                 setAPstate(false, AP_STATE_WAIT_RESET);
                 if (!bringAPOnline()) {
                     // tried to reset the AP, but we failed... Maybe the AP-Tag died?
-                    setAPstate(false, AP_STATE_FAILED);
+                    // A C6 update may have taken the radio meanwhile (bringAPOnline() then fails on purpose): leave
+                    // FLASHING alone, or this loop resets the C6 in the middle of the flash 30 s later.
+                    if (apInfo.state != AP_STATE_FLASHING) {
+                        setAPstate(false, AP_STATE_FAILED);
 #ifdef HAS_RGB_LED
-                    showColorPattern(CRGB::Yellow, CRGB::Yellow, CRGB::Red);
+                        showColorPattern(CRGB::Yellow, CRGB::Yellow, CRGB::Red);
 #endif
-                    lastAPActivity = millis();  // we set this to retrigger a recovery in AP_ACTIVITY_MAX_INTERVAL seconds
+                        lastAPActivity = millis();  // we set this to retrigger a recovery in AP_ACTIVITY_MAX_INTERVAL seconds
+                    }
                 } else {
                     setAPstate(true, AP_STATE_ONLINE);
                     attempts = 0;
-                    refreshAllPending();
+                    refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                 }
             }
         }

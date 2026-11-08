@@ -901,7 +901,7 @@ float truetypeClass::isLeft(ttCoordinate_t *_p0, ttCoordinate_t *_p1, ttCoordina
 }
 
 void truetypeClass::textDraw(int16_t _x, int16_t _y, const wchar_t _character[]) {
-    uint8_t c = 0;
+    uint16_t c = 0;
     uint16_t prev_code = 0;
 
     while (_character[c] != '\0') {
@@ -940,6 +940,9 @@ void truetypeClass::textDraw(int16_t _x, int16_t _y, const wchar_t _character[])
 
         // Line breaks with line feed code
         if (_character[c] == '\n') {
+            freePointsAll();
+            freeGlyph();
+            c++;
             _x = start_x;
             _y += characterSize;
             if (_y > end_y) {
@@ -1174,7 +1177,7 @@ uint32_t truetypeClass::seekToTable(const char *name) {
 /* calculate */
 void truetypeClass::stringToWchar(String _string, wchar_t _charctor[]) {
     uint16_t s = 0;
-    uint8_t c = 0;
+    uint16_t c = 0;
     uint32_t codeu32;
 
     while (_string[s] != '\0') {
@@ -1186,9 +1189,11 @@ void truetypeClass::stringToWchar(String _string, wchar_t _charctor[]) {
                 break;
             case 2:
                 if (!IsU8LaterByte(_string[s + 1])) {
+                    s++;  // invalid UTF-8: skip this byte, otherwise the loop never ends
                     continue;
                 }
                 if ((uint8_t(_string[s]) & 0x1E) == 0) {
+                    s++;
                     continue;
                 }
 
@@ -1198,10 +1203,12 @@ void truetypeClass::stringToWchar(String _string, wchar_t _charctor[]) {
                 break;
             case 3:
                 if (!IsU8LaterByte(_string[s + 1]) || !IsU8LaterByte(_string[s + 2])) {
+                    s++;
                     continue;
                 }
                 if ((uint8_t(_string[s]) & 0x0F) == 0 &&
                     (uint8_t(_string[s + 1]) & 0x20) == 0) {
+                    s++;
                     continue;
                 }
 
@@ -1213,10 +1220,12 @@ void truetypeClass::stringToWchar(String _string, wchar_t _charctor[]) {
             case 4:
                 if (!IsU8LaterByte(_string[s + 1]) || !IsU8LaterByte(_string[s + 2]) ||
                     !IsU8LaterByte(_string[s + 3])) {
+                    s++;
                     continue;
                 }
                 if ((uint8_t(_string[s]) & 0x07) == 0 &&
                     (uint8_t(_string[s + 1]) & 0x30) == 0) {
+                    s++;
                     continue;
                 }
 
@@ -1227,6 +1236,7 @@ void truetypeClass::stringToWchar(String _string, wchar_t _charctor[]) {
                 s += 4;
                 break;
             default:
+                s++;
                 continue;
         }
 

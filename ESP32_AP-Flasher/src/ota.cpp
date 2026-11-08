@@ -7,6 +7,8 @@
 #include <MD5Builder.h>
 #include <Update.h>
 
+#include <atomic>
+
 #include "flasher.h"
 #include "espflasher.h"
 #include "leds.h"
@@ -15,6 +17,7 @@
 #include "supervisor.h"
 #include "tag_db.h"
 #include "util.h"
+#include "uploadinfo.h"
 #include "web.h"
 
 
@@ -107,83 +110,42 @@ void handleCheckFile(AsyncWebServerRequest* request) {
     request->send(200, "application/json", jsonResponse);
 }
 
-#define UPLOAD_BUFFER_SIZE 32768
-
-struct UploadInfo {
-    String filename;
-    uint8_t buffer[UPLOAD_BUFFER_SIZE];
-    size_t bufferSize;
-};
-
 void handleLittleFSUpload(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-    String uploadfilename;
-    bool error = false;
     if (!index) {
-        String path;
         if (!request->hasParam("path", true)) {
-            final = true;
-            error = true;
-        } else {
-            uploadfilename = request->getParam("path", true)->value();
-            Serial.println("update " + uploadfilename);
-            File file = contentFS->open(uploadfilename, "w");
-            file.close();
-            UploadInfo* uploadInfo = new UploadInfo{uploadfilename, {}, 0};
-            request->_tempObject = (void*)uploadInfo;
+            request->send(400, "text/plain", "parameters incomplete");
+            return;
         }
+        const String uploadfilename = request->getParam("path", true)->value();
+        Serial.println("update " + uploadfilename);
+        UploadInfo* uploadInfo = newUploadInfo(uploadfilename);
+        if (uploadInfo == nullptr) {
+            request->send(500, "text/plain", "Out of memory or path too long");
+            return;
+        }
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
+        File file = contentFS->open(uploadfilename, "w");
+        file.close();
+        xSemaphoreGive(fsMutex);
+        request->_tempObject = (void*)uploadInfo;
     }
 
     UploadInfo* uploadInfo = static_cast<UploadInfo*>(request->_tempObject);
+    if (uploadInfo == nullptr) return;
 
-    if (uploadInfo != nullptr) {
-        uploadfilename = uploadInfo->filename;
+    if (len) appendUploadInfo(uploadInfo, data, len);
+    if (!final) return;
 
-        if (len) {
-            if (uploadInfo->bufferSize + len <= UPLOAD_BUFFER_SIZE) {
-                memcpy(&uploadInfo->buffer[uploadInfo->bufferSize], data, len);
-                uploadInfo->bufferSize += len;
-            } else {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    uploadInfo->bufferSize = 0;
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    final = true;
-                    error = true;
-                }
+    flushUploadInfo(uploadInfo);
+    const bool error = uploadInfo->error;
+    if (error) logLine("Failed to write " + String(uploadInfo->filename));
+    request->_tempObject = nullptr;
+    free(uploadInfo);
 
-                memcpy(uploadInfo->buffer, data, len);
-                uploadInfo->bufferSize = len;
-            }
-        }
-        if (final) {
-            if (uploadInfo->bufferSize > 0) {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    error = true;
-                }
-                request->_tempObject = nullptr;
-                delete uploadInfo;
-            }
-
-            if (error) {
-                request->send(507, "text/plain", "Error. Disk full?");
-            } else {
-                request->send(200, "text/plain", "Ok, file written");
-            }
-        }
+    if (error) {
+        request->send(507, "text/plain", "Error. Disk full?");
+    } else {
+        request->send(200, "text/plain", "Ok, file written");
     }
 }
 
@@ -259,7 +221,15 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
                 }
             });
 
-            const size_t written = Update.writeStream(httpClient.getStream());
+            // writeStream() checks the image header with a non-blocking peek() first: when the body
+            // hasn't arrived yet (GET() returns after the headers), that fails at once, as a wrong
+            // magic byte. Wait for the first bytes.
+            WiFiClient &stream = httpClient.getStream();
+            const uint32_t waitStart = millis();
+            while (stream.available() == 0 && stream.connected() && millis() - waitStart < 10000) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+            const size_t written = Update.writeStream(stream);
             if (written == httpClient.getSize()) {
                 if (Update.end(true)) {
                     wsSerial("Firmware update successful");
@@ -284,7 +254,10 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
     }
 
     httpClient.end();
-    config.runStatus = RUNSTATUS_RUN;
+    // While the AP is FLASHING, the C6 update owns runStatus (a flash still running, or one that failed after the
+    // radio was put into its bootloader). Keep its STOP: the C6 task sets RUN when it finishes, or the supervisor's
+    // 30-minute STOP restart brings the radio back.
+    if (apInfo.state != AP_STATE_FLASHING) config.runStatus = RUNSTATUS_RUN;
     supervisorMaintenance(false);
 }
 
@@ -308,6 +281,9 @@ void handleRollback(AsyncWebServerRequest* request) {
 }
 
 #ifdef C6_OTA_FLASHING
+// One radio update at a time: updates share the debug UART, the reset/boot pins and the firmware files
+static std::atomic<bool> c6UpdateBusy{false};
+
 void C6firmwareUpdateTask(void* parameter) {
     char* urlPtr = reinterpret_cast<char*>(parameter);
 
@@ -315,53 +291,65 @@ void C6firmwareUpdateTask(void* parameter) {
     supervisorMaintenance(true);
     wsSerial("Stopping AP service");
 
-    gSerialTaskState = SERIAL_STATE_STOP;
     config.runStatus = RUNSTATUS_STOP;
     setAPstate(false, AP_STATE_FLASHING);
+    stopApReader();  // the one radio reader (upstream 1ba8b87); bringAPOnline() starts it again
 #ifndef FLASHER_DEBUG_SHARED
-    extern bool rxSerialStopTask2;
+    extern volatile bool rxSerialStopTask2;
     rxSerialStopTask2 = true;
 #endif
     vTaskDelay(500 / portTICK_PERIOD_MS);
     Serial1.end();
+    // again: APTask may have overwritten FLASHING in the first 0.5 s (a recovery or an ACK that was in flight)
     setAPstate(false, AP_STATE_FLASHING);
 
     wsSerial(SHORT_CHIP_NAME " flash starting");
 
-    bool result = FlashC6_H2(urlPtr);
+    bool radioTouched = false;
+    bool result = FlashC6_H2(urlPtr, &radioTouched);
 
     wsSerial(SHORT_CHIP_NAME " flash end");
 
-    if (result) {
+    // After a flash, and also when the radio was never touched (download failed, firmware refused): bring it back
+    // right away instead of leaving the AP stopped until the supervisor restarts it.
+    if (result || !radioTouched) {
         setAPstate(false, AP_STATE_OFFLINE);
 
-        wsSerial("Finishing config...");
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        if (result) {
+            wsSerial("Finishing config...");
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+        }
 
         wsSerial("starting monitor");
-        Serial1.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
 #ifndef FLASHER_DEBUG_SHARED
         rxSerialStopTask2 = false;
         xTaskCreate(rxSerialTask2, "rxSerialTask2", 1850, NULL, 2, NULL);
 #endif
         vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        apInfo.version = 0;
+        if (result) apInfo.version = 0;
         wsSerial("bringing AP online");
         // if (bringAPOnline(AP_STATE_REQUIRED_POWER_CYCLE)) config.runStatus = RUNSTATUS_STOP;
         if (bringAPOnline(AP_STATE_ONLINE)) {
             config.runStatus = RUNSTATUS_RUN;
             setAPstate(true, AP_STATE_ONLINE);
+        } else {
+            // As after a failed start at boot: APTask's ping recovery keeps trying (it ignores OFFLINE), and with
+            // runStatus RUN the BLE devices keep getting content meanwhile.
+            setAPstate(false, AP_STATE_FAILED);
+            config.runStatus = RUNSTATUS_RUN;
         }
 
         // Wait for version info to arrive
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        if(apInfo.version == 0) {
+        if(result && apInfo.version == 0) {
            result = false;
         }
     }
 
-    if (result) {
+    if (!result && !radioTouched) {
+       wsSerial("Nothing was flashed, the radio keeps its firmware.");
+    } else if (result) {
        wsSerial("Finished!");
        char buffer[50];
        snprintf(buffer,sizeof(buffer),
@@ -377,9 +365,10 @@ void C6firmwareUpdateTask(void* parameter) {
     // wsSerial("Reboot system now");
     // wsSerial("[reboot]");
     free(urlPtr);
-    // On failure the AP stays FLASHING with runStatus STOP; the supervisor restarts it 30 min from here unless the
-    // user retries the update first.
+    // When a flash failed after the radio was touched, the AP stays FLASHING with runStatus STOP; the supervisor
+    // restarts it 30 min from here unless the user retries the update first.
     supervisorMaintenance(false);
+    c6UpdateBusy = false;  // nothing below touches the radio
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
 }
@@ -389,9 +378,19 @@ void C6firmwareUpdateTask(void* parameter) {
 void handleUpdateC6(AsyncWebServerRequest* request) {
 #if defined C6_OTA_FLASHING
     if (request->hasParam("url",true)) {
-        const char* urlStr = request->getParam("url", true)->value().c_str();
-        char* urlCopy = strdup(urlStr);
-        xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 6400, urlCopy, 10, NULL);
+        bool expected = false;
+        if (!c6UpdateBusy.compare_exchange_strong(expected, true)) {
+            request->send(409, "text/plain", "A radio update is already running");
+            return;
+        }
+        char* urlCopy = strdup(request->getParam("url", true)->value().c_str());
+        // 10240: an HTTPS download left only 96 bytes of a 6400-byte stack on the Yellow AP (upstream 4ac63fc)
+        if (urlCopy == nullptr || xTaskCreate(C6firmwareUpdateTask, "OTAUpdateTask", 10240, urlCopy, 10, NULL) != pdPASS) {
+            free(urlCopy);
+            c6UpdateBusy = false;
+            request->send(500, "text/plain", "Could not start the update");
+            return;
+        }
         request->send(200, "Ok");
     }
     else {

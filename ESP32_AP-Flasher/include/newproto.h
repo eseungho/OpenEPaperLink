@@ -34,7 +34,9 @@ extern bool showAPSegmentedInfo(const uint8_t* dst, bool local);
 extern void updateTaginfoitem(struct TagInfo* taginfoitem, IPAddress remoteIP);
 bool checkMirror(struct tagRecord* taginfo, struct pendingData* pending);
 
-void refreshAllPending();
+// radioTagsOnly: for a radio (re)start. BLE devices hold nothing in the radio and keep their queue, so redrawing one
+// would queue its content a second time (a waiting Nemonic label is never replaced: it would print twice).
+void refreshAllPending(bool radioTagsOnly = false);
 void updateContent(const uint8_t* dst);
 void setAPchannel();
 

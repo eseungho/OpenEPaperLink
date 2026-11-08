@@ -580,9 +580,15 @@ static bool wolink_upload(uint8_t address[8]) {
 
 // The item BLETask sent (BLE_curr_dataVer) reached the device: count the update, start the tries afresh.
 static void BLE_reportDelivered() {
-    struct espXferComplete reportStruct;
-    memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
-    processXferComplete(&reportStruct, true, BLE_curr_dataVer);
+    if (config.runStatus == RUNSTATUS_STOP) {
+        // processXferComplete() ignores reports while the AP is stopped (OTA, C6 flash, modem reset, reboot), but the
+        // device has the item: take it off the queue, or it is sent (a label printed) again
+        dropQueueItem(BLE_curr_address, BLE_curr_dataVer);
+    } else {
+        struct espXferComplete reportStruct;
+        memcpy((uint8_t*)&reportStruct.src, BLE_curr_address, 8);
+        processXferComplete(&reportStruct, true, BLE_curr_dataVer);
+    }
     BLE_clear_attempts(BLE_curr_address);
 }
 
@@ -617,7 +623,9 @@ static void BLE_attemptFailed(const char* why) {
     BLE_curr_part = 0;
     const uint32_t tries = BLE_get_attempts(BLE_curr_address);
     Serial.printf("BLE upload failed (%s), try %u of %u\r\n", why, (unsigned)tries, (unsigned)BLE_MAX_TRIES);
-    if (tries >= BLE_MAX_TRIES) BLE_giveUp();
+    // Give up only the item that failed. If it was replaced, cleared or dropped during this try (e.g. a newer image
+    // arrived while a Wolink connected and authenticated), what is queued now was never tried: it gets the next try.
+    if (tries >= BLE_MAX_TRIES && getQueueItem(BLE_curr_address, BLE_curr_dataVer) != nullptr) BLE_giveUp();
 }
 
 // The item can't be delivered at all (e.g. a label raster of the wrong size): drop just that item.
@@ -656,7 +664,9 @@ void BLETask(void* parameter) {
                     Serial.println("Doing the BLE Scan");
                     BLE_startScan(10);  // timeout in seconds, this is blocking but only for this thread!
                 }
-                if (millis() - BLE_last_pending_check >= (INTERVAL_HANDLE_PENDING_SECONDS * 1000)) {
+                // Nothing new is sent while the AP is stopped, as for the radio (processBlockRequest()): completions and
+                // give-ups are not recorded then, so an item would be sent (a label printed) again and again.
+                if (config.runStatus != RUNSTATUS_STOP && millis() - BLE_last_pending_check >= (INTERVAL_HANDLE_PENDING_SECONDS * 1000)) {
                     if (BLE_is_image_pending(BLE_curr_address)) {
                         Serial.println("BLE Image is pending but we wait a bit");
                         delay(5000);                                                       // We better wait here, since the pending image needs to be created first

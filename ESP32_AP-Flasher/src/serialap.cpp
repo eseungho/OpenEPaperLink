@@ -451,7 +451,7 @@ void rxCmdProcessor(void* parameter) {
                         break;
                     case RX_CMD_RSET:
                         Serial.println("AP did reset, resending pending\r\n");
-                        refreshAllPending();
+                        refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                         sendChannelPower(&curChannel);
                         break;
                     case RX_CMD_TRD:
@@ -1062,7 +1062,7 @@ void APTask(void* parameter) {
         }
 #endif
 
-        refreshAllPending();
+        refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
     } else {
 #ifndef FLASH_TIMEOUT
 #define FLASH_TIMEOUT 30
@@ -1096,7 +1096,7 @@ void APTask(void* parameter) {
                         segmentedShowIp();
                         showAPSegmentedInfo(apInfo.mac, true);
                     }
-                    refreshAllPending();
+                    refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                 } else {
                     Serial.printf("Failed to bring up the AP after successful flashing... That's not supposed to happen!\r\n");
                     Serial.printf("This generally means that the flasher connections (MISO/MOSI/CLK/RESET/CS) are okay,\r\n");
@@ -1198,7 +1198,7 @@ void APTask(void* parameter) {
                 } else {
                     setAPstate(true, AP_STATE_ONLINE);
                     attempts = 0;
-                    refreshAllPending();
+                    refreshAllPending(true);  // radio (re)start: BLE devices keep their queue
                 }
             }
         }

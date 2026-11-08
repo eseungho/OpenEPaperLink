@@ -393,6 +393,7 @@ void init_web() {
                 if (taginfo != nullptr) {
                     const char *cmdValue = request->getParam("cmd", true)->value().c_str();
                     if (strcmp(cmdValue, "del") == 0) {
+                        dequeueAllItems(mac);  // a record added again would otherwise inherit these items (labels print)
                         wsSendTaginfo(mac, SYNC_DELETE);
                         deleteRecord(mac);
                     }
@@ -401,6 +402,7 @@ void init_web() {
                         time(&now);
                         for (tagRecord *tag : tagDBSnapshot()) {
                             if (tag->expectedNextCheckin == 3216153600 || tag->lastseen < now - 24 * 3600 || now > tag->expectedNextCheckin + 600) {
+                                dequeueAllItems(tag->mac);
                                 wsSendTaginfo(tag->mac, SYNC_DELETE);
                                 deleteRecord(tag->mac);
                             }

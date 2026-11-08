@@ -295,9 +295,10 @@ NemonicResult nemonic_upload(uint8_t address[8]) {
     // 9) PRINT (cut or no-cut), or skip if debug noprint set.
     if (!opts.noprint) {
         uint8_t printCmd[2] = { 0x1B, (uint8_t)(opts.cut ? 0x50 : 0x51) };
-        // Once PRINT is handed to the stack the label may print, so it counts as delivered even if the write
-        // reports an error: printing it twice is worse than missing one.
-        if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) Serial.println("Nemonic: PRINT write reported an error");
+        // A failed write never reached the controller (NimBLE frees the packet and returns an error), so the printer
+        // can't have it: retry, the next INIT discards the frames. Once the write succeeds the label may print, so
+        // from then on it counts as delivered and is never sent again.
+        if (!nemonic_write_chunked(writeChar, printCmd, sizeof(printCmd))) return fail("PRINT write failed");
         vTaskDelay(50 / portTICK_PERIOD_MS);
     } else {
         Serial.println("Nemonic: noprint=1, skipping final PRINT");

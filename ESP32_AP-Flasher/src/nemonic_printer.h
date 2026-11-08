@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 enum NemonicResult {
-    NEMONIC_DELIVERED,  // the PRINT command went out: never print this label again
+    NEMONIC_DELIVERED,  // the PRINT command was handed to the BLE stack: never print this label again
     NEMONIC_RETRY,      // failed before PRINT (connection, ACK, memory): try again; INIT discards partial frames
     NEMONIC_DROP,       // the label can't be printed (bad raster): drop it, keep the other queued labels
 };

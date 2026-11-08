@@ -216,7 +216,11 @@ bool prepareDataAvail(String& filename, uint8_t dataType, uint8_t dataTypeArgume
 
     file.close();
 
-    if (memcmp(md5bytes, taginfo->md5, 8) == 0) {
+    // A label printer shows nothing, so it has no "current image": every uploaded label (content 24 external image,
+    // 25 Home Assistant; the upload is deleted once rendered) is a print job of its own, also when it equals the last
+    // label printed. Re-renders of the other modes stay deduplicated, so they don't print duplicate labels.
+    const bool uploadedLabel = taginfo->hwType == NEMONIC_BLE_MIP201 && (taginfo->contentMode == 24 || taginfo->contentMode == 25);
+    if (!uploadedLabel && memcmp(md5bytes, taginfo->md5, 8) == 0) {
         wsLog("new image is the same as current image. not updating tag.");
         wsSendTaginfo(dst, SYNC_TAGSTATUS);
         if (contentFS->exists(filename) && resend == false) {
@@ -651,8 +655,9 @@ void processTagReturnData(struct espTagReturnData* trd, uint8_t len, bool local)
 #endif
 }
 
-void refreshAllPending() {
+void refreshAllPending(bool radioTagsOnly) {
     for (tagRecord* taginfo : tagDBSnapshot()) {
+        if (radioTagsOnly && isBleTag(taginfo->mac, taginfo->hwType)) continue;
         if (taginfo->pendingCount > 0 && taginfo->version == 0) {
             clearPending(taginfo);
             taginfo->nextupdate = 0;

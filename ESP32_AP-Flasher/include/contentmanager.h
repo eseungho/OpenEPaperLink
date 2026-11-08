@@ -15,7 +15,8 @@ struct contentTypes {
     String optionList;
 };
 
-void contentRunner();
+// bleOnly: only BLE devices (isBleTag()), for when the radio is down: they don't need it, radio tags wait for it
+void contentRunner(bool bleOnly = false);
 void checkVars();
 void drawNew(const uint8_t mac[8], tagRecord *&taginfo);
 bool updateTagImage(String &filename, const uint8_t *dst, uint16_t nextCheckin, tagRecord *&taginfo, imgParam &imageParams);

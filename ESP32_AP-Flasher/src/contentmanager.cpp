@@ -51,7 +51,7 @@ bool needRedraw(uint8_t contentMode, uint8_t wakeupReason) {
     return false;
 }
 
-void contentRunner() {
+void contentRunner(bool bleOnly) {
     if (config.runStatus == RUNSTATUS_STOP) return;
 
     time_t now;
@@ -66,6 +66,7 @@ void contentRunner() {
         // reboot run its shutdown (DB save) without waiting for the whole pass.
         supervisorHeartbeat(SUPERVISED_LOOP);
         if (supervisorRebootPending()) break;
+        if (bleOnly && !isBleTag(taginfo->mac, taginfo->hwType)) continue;
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
         if (taginfo->RSSI &&

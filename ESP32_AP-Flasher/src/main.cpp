@@ -190,8 +190,8 @@ void setup() {
 
 void loop() {
     supervisorLoopTick();
-    // Here and not in contentRunner(): that doesn't run while the radio is down or the AP is stopped, and
-    // BLE uploads keep retiring queue items (with their image data) meanwhile.
+    // Here and not in contentRunner(): that doesn't run while the AP is stopped (or, without BLE, while the radio
+    // is down), and BLE uploads keep retiring queue items (with their image data) meanwhile.
     freeDeletedRecords();
     freeRetiredQueueItems();
     ws.cleanupClients();
@@ -206,8 +206,17 @@ void loop() {
     if (intervalSaveDB.doRun() && config.runStatus != RUNSTATUS_STOP) {
         saveDB("/current/tagDB.json");
     }
-    if (intervalContentRunner.doRun() && (apInfo.state == AP_STATE_ONLINE || apInfo.state == AP_STATE_NORADIO)) {
-        contentRunner();
+    if (intervalContentRunner.doRun()) {
+        if (apInfo.state == AP_STATE_ONLINE || apInfo.state == AP_STATE_NORADIO) {
+            contentRunner();
+        }
+#ifdef HAS_BLE_WRITER
+        else if (apInfo.state != AP_STATE_FLASHING) {
+            // The radio is down (hung, recovering, or it never came up), but BLE devices don't need it: keep their
+            // content coming. Radio tags wait for the radio, as before.
+            contentRunner(true);
+        }
+#endif
     }
 
 #ifdef HAS_TFT
